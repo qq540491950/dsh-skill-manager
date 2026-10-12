@@ -212,37 +212,27 @@ async function withEnv(vars, run) {
 
 /** 搭一套宿主替身；每个成员都记录自己的调用，断言才有「实际发生了什么」可看。 */
 function makeHost(options = {}) {
-  const calls = { snapshot: [], scopedSnapshot: [], get: [], scopedGet: [], acquireScope: [], observeSession: [], serviceFor: [], lstat: [] }
+  const calls = {
+    snapshot: [],
+    scopedSnapshot: [],
+    get: [],
+    scopedGet: [],
+    acquireScope: [],
+    observeSession: [],
+    serviceFor: [],
+    lstat: [],
+    resolve: [],
+    listDir: [],
+    stat: [],
+    readText: [],
+  }
   const fixtures = options.skills ?? SKILLSET
   const contents = options.contents ?? {}
-
-  /**
-   * 假 logger：捕获 exporter 注册，并允许测试**在读取过程中**把日志打进去。
-   * 时序很关键——`readCatalog` 每次读取开始都会清空失败记录，所以"读取前先打日志"
-   * 会被正确地清掉，模拟不出真实场景（提供方是在 list() 期间抛错并打日志的）。
-   */
-  const exporters = []
-  const logger = {
-    exporter(config) {
-      exporters.push(config)
-      return () => {}
-    },
-  }
-  const emitLog = (line, type = 'warn') => {
-    for (const exporter of exporters) exporter.export({ args: [line], type, ts: 1 })
-  }
 
   /** 两个注册表（全局的 / preset 组内的）行为一致，只是记账通道不同。 */
   const registry = (recordSnapshot, recordGet) => ({
     async snapshot(o) {
       recordSnapshot(o)
-      // 真实时序：提供方 list() 抛错 → dsh-skill 打 warn → 候选被整体丢弃、complete=false。
-      // `onSnapshot` 让测试能在**读取过程中**打任意日志，这是验证"只认该前缀"的唯一办法
-      // （读取前打的日志会被 readCatalog 正常清掉，那样断言会平凡通过）。
-      if (typeof options.onSnapshot === 'function') options.onSnapshot(emitLog)
-      if (options.providerFailure !== undefined) {
-        emitLog(`skill provider "filesystem" skipped: ${options.providerFailure}`)
-      }
       return { skills: options.skills ?? SKILLSET, complete: options.complete ?? true }
     },
     async get(name, o) {
@@ -318,7 +308,23 @@ function makeHost(options = {}) {
 
   const routes = []
   const existingPaths = options.existingPaths ?? []
-  /** 抽象 fs 替身：只认给定的存在路径；`noFs` 时整个服务缺席。 */
+  /** 直读路径用的目录表：`目录路径 → [{ name, type }]`。没登记 = 这个根不存在。 */
+  const dirs = options.dirs ?? {}
+  /** 直读路径用的文件表：`文件路径 → 正文`。 */
+  const files = options.files ?? {}
+  /** 这些路径**连 resolve 都失败**（模拟沙箱拒绝 / 路径不可达）。 */
+  const unresolvable = options.unresolvable ?? []
+
+  /**
+   * `ctx.fs` 替身，形状逐条对齐 `dsh-fs-local`：
+   *  - `lstat(path)` 收**路径**（`pathExists` 用它探存在性）
+   *  - `resolve(path)` 收路径、回 `{ targetKey, displayPath }`
+   *  - `listDir` / `stat` / `readText` 收**解析后的 target**
+   *
+   * 没登记的目录/文件一律抛错——真实世界里「根不存在」就是这个形状，
+   * 而 `scanRoot` 必须把它降级成「这个根没有候选」，而不是把整页带下去。
+   * `noFs` 时整个服务缺席（直读与存在性探测都应优雅降级）。
+   */
   const fs = options.noFs === true
     ? undefined
     : {
@@ -327,11 +333,34 @@ function makeHost(options = {}) {
           if (options.fsThrows === true) throw new Error('sandbox denied')
           return existingPaths.includes(target) ? { isDirectory: true } : undefined
         },
+        async resolve(path) {
+          calls.resolve.push(path)
+          if (unresolvable.includes(path)) throw new Error(`cannot resolve ${path}`)
+          return { targetKey: path, displayPath: path }
+        },
+        async listDir(target) {
+          calls.listDir.push(target.displayPath)
+          const entries = dirs[target.displayPath]
+          if (entries === undefined) throw new Error(`cannot list ${target.displayPath}`)
+          return entries.map((entry) => ({
+            name: entry.name,
+            type: entry.type,
+            target: { targetKey: `${target.displayPath}/${entry.name}`, displayPath: `${target.displayPath}/${entry.name}` },
+          }))
+        },
+        async stat(target) {
+          calls.stat.push(target.displayPath)
+          return files[target.displayPath] === undefined ? undefined : { type: 'file' }
+        },
+        async readText(target) {
+          calls.readText.push(target.displayPath)
+          const text = files[target.displayPath]
+          if (text === undefined) throw new Error(`cannot read ${target.displayPath}`)
+          return text
+        },
       }
   const scope = {
     skills,
-    // cordis 内置服务（不需要 inject 声明）。
-    logger: options.noLogger === true ? undefined : logger,
     get(name) {
       return { agentPresets: presets, agents, sessionQuery, workspaceRegistry: undefined, fs }[name]
     },
@@ -350,7 +379,7 @@ function makeHost(options = {}) {
     },
     get: scope.get,
   }
-  return { ctx, routes, calls, lease, observation, liveAgent, scopedRegistry, skills, fs, exporters, emitLog }
+  return { ctx, routes, calls, lease, observation, liveAgent, scopedRegistry, skills, fs }
 }
 
 const hostModule = await import(new URL('../lib/index.js', import.meta.url).href)
@@ -366,10 +395,24 @@ const POST = (payload) =>
     body: JSON.stringify(payload),
   })
 
-/** 跑一次 GET，返回 `{ status, body }`。 */
+/**
+ * 跑一次 GET，返回 `{ status, body }`。
+ *
+ * ⚠️ 失败响应是 `{ ok:false, error }`，**没有 `data`**。这里统一补成文档里的**空形状**，
+ * 好让断言干干净净地报「某个字段不对」，而不是在 `body.data.skills` 上抛 TypeError
+ * 把整个自检进程带下去——后者会让**后面的断言根本来不及跑**，反向验证时极具欺骗性
+ * （踩过：注入「一个根抛错」，自检直接崩在 B24，看起来像"注入没生效"）。
+ *
+ * 补默认值不会掩盖回归：`skills` / `roots` / `complete` 各自都有**专门的**断言
+ * （B24 / B38 / B54），字段一缺就是一条干净的失败。
+ */
 async function getJson(host, query = '') {
   const response = await host.routes[0].fetch(GET(query))
-  return { status: response.status, body: await response.json() }
+  const body = await response.json()
+  if (body !== null && typeof body === 'object' && body.data === undefined) {
+    body.data = { skills: [], counts: {}, providers: {}, roots: [], complete: false }
+  }
+  return { status: response.status, body }
 }
 
 // —— 路由注册 ——
@@ -547,43 +590,216 @@ check('B65', fsThrowsResult.status === 200 && fsThrowsData.skills.length === SKI
 check('B68', fsThrowsData.roots?.length === 6, `fs 抛错时 roots 条数 = ${fsThrowsData.roots?.length}，仍应给出 6 条（存在性降级为未判定，而不是整块消失）`)
 check('B69', fsThrowsRoot['project-dsh']?.exists === undefined, `fs 抛错时 exists = ${JSON.stringify(fsThrowsRoot['project-dsh']?.exists)}，应为 undefined（未判定）`)
 
-// ── 提供方被跳过的原文 ────────────────────────────────────────────────────
-// `dsh-skill/lib/index.js:354` 在某个提供方 list() 抛错时打
-// `skill provider "<name>" skipped: <detail>`，然后把这个提供方的候选**全部丢掉**。
-// 这就是「项目/全局/自定义都是 0，但完整性是未完成，而提供方列表里没有 filesystem」的答案。
-const PROVIDER_ERROR = "ENOENT: no such file or directory, scandir 'D:/.../app.asar/.../skills'"
-const failHost = makeHost({ providerFailure: PROVIDER_ERROR, complete: false })
-hostModule.apply(failHost.ctx)
-const failResult = await getJson(failHost, '?sessionId=session-live')
-check('B70', failHost.exporters.length === 1, `注册了 ${failHost.exporters.length} 个 logger exporter，期望 1`)
-// 内置 exporter 正是**没声明 levels** 才把 warn 丢掉（见 dsh-mcp-manager 的实测），必须显式拉满。
-check('B71', failHost.exporters[0]?.levels?.default === 3, `exporter levels = ${JSON.stringify(failHost.exporters[0]?.levels)}，必须是 { default: 3 }`)
-const failure = failResult.body.data.providerFailures
-check('B72', failure?.filesystem?.message === PROVIDER_ERROR, `providerFailures = ${JSON.stringify(failure)}`)
-check('B73', failure?.filesystem?.level === 'warn', `level = ${JSON.stringify(failure?.filesystem?.level)}`)
-check('B74', Object.keys(failure).length === 1, `只应记录被跳过的那个提供方，实际 ${JSON.stringify(Object.keys(failure))}`)
+// ── 规范根目录**直读**：把项目 skill 从「上游整条丢光」里救回来 ─────────────
+//
+// 背景（用户实测截图带来的真实 bug）：`dsh-skill-filesystem` 的 `list()` 是
+// `for (root of roots) for (skill of await discoverRoot(root))`，**没有 per-root
+// try/catch**。本机 profile 里 `customSkillDirs` 指向 app.asar 内的路径，`ctx.fs.listDir`
+// 在它上面抛错 → 该提供方的**全部**候选（含项目根里明明存在的 skill）一起被丢掉。
+// 页面上表现为「选了项目还是只有随包内置那几个」。
+//
+// 本插件的处置：自己按官方同一套根目录规则只读直读一遍，**注册表优先**地合并。
+const PROJECT_ROOT = 'D:/project/agent-go'
+const PROJECT_AGENTS_ROOT = `${PROJECT_ROOT}/.agents/skills`
+const PROJECT_DSH_ROOT = `${PROJECT_ROOT}/.dsh/skills`
+const AGENTS_HOME_ROOT = 'C:/agents/skills'
+const DSH_HOME_ROOT = 'C:/dsh/skills'
 
-// 没有失败就不能编造（否则这行会变成噪声，用户学会无视它）
-const cleanResult = await getJson(baseHost)
-check('B75', Object.keys(cleanResult.body.data.providerFailures ?? {}).length === 0, `没有失败时应为空对象，实际 ${JSON.stringify(cleanResult.body.data.providerFailures)}`)
+/** 造一份 `SKILL.md`。 */
+const md = (name, description, extra = '') =>
+  `---\nname: ${name}\ndescription: ${description}\n${extra}---\n\n正文\n`
 
-// 只认该前缀：别的 warn（哪怕也提到 skill）不能入账。日志在**读取过程中**打，才绕不开清空逻辑。
-const noisyHost = makeHost({
-  onSnapshot: (log) => {
-    log('something unrelated happened')
-    log('skill "x" from y ignored because a higher-priority skill already exists')
-    log('mcp-client(foo): connection attempt failed')
+const scanHost = makeHost({
+  // 让项目根解析得到：官方与直读都靠「最近的含 .git 祖先」。
+  existingPaths: [`${PROJECT_ROOT}/.git`],
+  // 注册表里只剩 bundled —— 正是上游把 filesystem 提供方整个丢掉之后的样子。
+  skills: [skill('office-docx', 'bundled')],
+  complete: false,
+  dirs: {
+    [PROJECT_AGENTS_ROOT]: [
+      { name: 'git-commit', type: 'directory' },
+      { name: 'handoff', type: 'directory' },
+      { name: 'flat-skill.md', type: 'file' },
+      { name: 'notes.txt', type: 'file' },
+      { name: 'no-frontmatter', type: 'directory' },
+      { name: 'Bad_Name', type: 'directory' },
+      { name: 'no-description', type: 'directory' },
+      { name: 'legacy-keys', type: 'directory' },
+    ],
+    [AGENTS_HOME_ROOT]: [{ name: 'global-one', type: 'directory' }],
+    // `.system` 是 `<dshHome>/skills` 独有的保留目录（官方 `skipSystem` 只挂在这个根上）。
+    [DSH_HOME_ROOT]: [{ name: '.system', type: 'directory' }, { name: 'dsh-one', type: 'directory' }],
+  },
+  files: {
+    [`${PROJECT_AGENTS_ROOT}/git-commit/SKILL.md`]: md('git-commit', '提交代码'),
+    [`${PROJECT_AGENTS_ROOT}/handoff/SKILL.md`]: md('handoff', '交接上下文', 'whenToUse: 需要交接时\n'),
+    [`${PROJECT_AGENTS_ROOT}/flat-skill.md`]: md('flat-skill', '平铺在根下的 skill'),
+    // ↓ 以下四个都必须被跳过：官方解析器也会跳过它们，**少列一个只是少列，多列一个才是错**。
+    [`${PROJECT_AGENTS_ROOT}/no-frontmatter/SKILL.md`]: '没有 frontmatter 的正文\n',
+    [`${PROJECT_AGENTS_ROOT}/Bad_Name/SKILL.md`]: md('Bad_Name', '名字不是 kebab-case'),
+    [`${PROJECT_AGENTS_ROOT}/no-description/SKILL.md`]: '---\nname: no-description\n---\n',
+    [`${PROJECT_AGENTS_ROOT}/legacy-keys/SKILL.md`]: md('legacy-keys', '用了旧键名', 'modelInvocable: false\n'),
+    [`${AGENTS_HOME_ROOT}/global-one/SKILL.md`]: md('global-one', '用户级 skill'),
+    [`${DSH_HOME_ROOT}/dsh-one/SKILL.md`]: md('dsh-one', 'DSH_HOME 下的 skill'),
+    [`${DSH_HOME_ROOT}/.system/SKILL.md`]: md('system-skill', '不该出现'),
   },
 })
-hostModule.apply(noisyHost.ctx)
-const noisyResult = await getJson(noisyHost, '?sessionId=session-live')
-check('B76', Object.keys(noisyResult.body.data.providerFailures ?? {}).length === 0, `无关日志不应入账，实际 ${JSON.stringify(noisyResult.body.data.providerFailures)}`)
+hostModule.apply(scanHost.ctx)
+// 用户级根的位置由 env 决定，必须在**请求期间**设好（宿主半边每请求现算一次）。
+const scanResult = await withEnv({ DSH_HOME: 'C:/dsh', DSH_AGENTS_HOME: 'C:/agents' }, () =>
+  getJson(scanHost, `?sessionId=session-live&cwd=${encodeURIComponent(PROJECT_ROOT)}`),
+)
+const scanData = scanResult.body.data
+const scanByName = Object.fromEntries(scanData.skills.map((row) => [row.name, row]))
 
-// 没有 logger 服务时优雅降级，而不是抛错
-const noLoggerHost = makeHost({ noLogger: true })
-hostModule.apply(noLoggerHost.ctx)
-const noLoggerResult = await getJson(noLoggerHost, '?sessionId=session-live')
-check('B77', noLoggerResult.status === 200 && noLoggerResult.body.ok === true, `缺 logger 时应正常工作，实际 ${noLoggerResult.status}`)
+check('B70', scanResult.status === 200 && scanResult.body.ok === true, `直读用例的 GET 失败：${JSON.stringify(scanResult.body).slice(0, 200)}`)
+// 这一条就是用户报的那个 bug：注册表给不出项目 skill，直读必须补上。
+check('B71', scanByName['git-commit'] !== undefined, `项目 skill 没被直读补进来，实际 = ${JSON.stringify(scanData.skills.map((r) => r.name))}`)
+check('B72', scanByName['git-commit']?.group === 'project', `git-commit.group = ${JSON.stringify(scanByName['git-commit']?.group)}，应落进「项目」`)
+check('B73', scanByName['git-commit']?.source === 'project-agents', `source = ${JSON.stringify(scanByName['git-commit']?.source)}（必须与官方 rank 表一致，否则分组会漂）`)
+check('B74', scanByName['git-commit']?.path === `${PROJECT_AGENTS_ROOT}/git-commit/SKILL.md`, `path = ${JSON.stringify(scanByName['git-commit']?.path)}`)
+check('B75', scanByName['git-commit']?.description === '提交代码', `description = ${JSON.stringify(scanByName['git-commit']?.description)}`)
+// 平铺的 `<name>.md` 也是官方认的形状。
+check('B76', scanByName['flat-skill']?.group === 'project', `根下的平铺 .md 没被识别，实际 = ${JSON.stringify(scanByName['flat-skill'])}`)
+check('B77', scanByName['handoff']?.whenToUse === '需要交接时', `whenToUse 没有透传，实际 = ${JSON.stringify(scanByName['handoff']?.whenToUse)}`)
+// 用户级两个根照样直读；注册表里那一条原样保留（两个来源合起来才是全貌）。
+check('B78', scanByName['global-one']?.group === 'global', `global-one.group = ${JSON.stringify(scanByName['global-one']?.group)}`)
+check(
+  'B78b',
+  scanByName['dsh-one']?.group === 'global' && scanByName['dsh-one']?.source === 'user-dsh',
+  `DSH_HOME 下的 skill 没被直读：${JSON.stringify(scanByName['dsh-one'])}`,
+)
+check('B79', scanByName['office-docx']?.group === 'bundled', '注册表原有的行不该被直读挤掉')
+// 一个非法文件都不许编出来。
+check(
+  'B80',
+  ['no-frontmatter', 'Bad_Name', 'no-description', 'legacy-keys', 'system-skill'].every((name) => scanByName[name] === undefined),
+  `不合法的文件被列出来了：${JSON.stringify(scanData.skills.map((r) => r.name))}`,
+)
+check('B81', scanByName['notes.txt'] === undefined, '非 .md 的文件不该被当成 skill')
+// 排序：官方按名字码点排序，合并后必须重排，顺序不能取决于哪个来源先到。
+check(
+  'B82',
+  JSON.stringify(scanData.skills.map((row) => row.name)) === JSON.stringify([...scanData.skills.map((row) => row.name)].sort()),
+  `合并后没有按名字排序：${JSON.stringify(scanData.skills.map((r) => r.name))}`,
+)
+check(
+  'B83',
+  scanData.skills.every((row, index) => row.index === index),
+  `index 没有重排：${JSON.stringify(scanData.skills.map((r) => r.index))}`,
+)
+
+// **注册表优先**：同名时必须以官方那一行为准，直读只补它没有的名字。
+const dedupeHost = makeHost({
+  existingPaths: [`${PROJECT_ROOT}/.git`],
+  skills: [skill('git-commit', 'user-dsh')],
+  dirs: { [PROJECT_AGENTS_ROOT]: [{ name: 'git-commit', type: 'directory' }] },
+  files: { [`${PROJECT_AGENTS_ROOT}/git-commit/SKILL.md`]: md('git-commit', '文件里的描述') },
+})
+hostModule.apply(dedupeHost.ctx)
+const dedupeData = (await getJson(dedupeHost, `?sessionId=session-live&cwd=${encodeURIComponent(PROJECT_ROOT)}`)).body.data
+const dedupeRows = dedupeData.skills.filter((row) => row.name === 'git-commit')
+check('B84', dedupeRows.length === 1, `同名条目应当只有 1 行，实际 ${dedupeRows.length} 行`)
+check('B85', dedupeRows[0]?.source === 'user-dsh', `同名时应保留注册表那一行，实际 source = ${JSON.stringify(dedupeRows[0]?.source)}`)
+check('B86', dedupeRows[0]?.description === 'git-commit 的描述', `同名时应保留注册表的描述，实际 = ${JSON.stringify(dedupeRows[0]?.description)}`)
+
+// **一个根读不了，不该拖垮别的根** —— 这正是上游缺的那层隔离。
+const isolatedHost = makeHost({
+  existingPaths: [`${PROJECT_ROOT}/.git`],
+  skills: [],
+  unresolvable: [PROJECT_DSH_ROOT],
+  dirs: { [PROJECT_AGENTS_ROOT]: [{ name: 'git-commit', type: 'directory' }] },
+  files: { [`${PROJECT_AGENTS_ROOT}/git-commit/SKILL.md`]: md('git-commit', '提交代码') },
+})
+hostModule.apply(isolatedHost.ctx)
+const isolatedResult = await getJson(isolatedHost, `?sessionId=session-live&cwd=${encodeURIComponent(PROJECT_ROOT)}`)
+check(
+  'B87',
+  isolatedResult.status === 200 && isolatedResult.body.data.skills.some((row) => row.name === 'git-commit'),
+  `一个根 resolve 失败时，另一个根必须照常出结果，实际 = ${JSON.stringify(isolatedResult.body.data.skills.map((r) => r.name))}`,
+)
+
+// 单个文件读不了（或不是普通文件）只丢那一条。
+const partialFileHost = makeHost({
+  existingPaths: [`${PROJECT_ROOT}/.git`],
+  skills: [],
+  dirs: {
+    [PROJECT_AGENTS_ROOT]: [
+      { name: 'readable', type: 'directory' },
+      { name: 'unreadable', type: 'directory' },
+      { name: 'a-directory-named-x', type: 'directory' },
+    ],
+  },
+  files: { [`${PROJECT_AGENTS_ROOT}/readable/SKILL.md`]: md('readable', '读得到') },
+})
+hostModule.apply(partialFileHost.ctx)
+const partialFileData = (await getJson(partialFileHost, `?sessionId=session-live&cwd=${encodeURIComponent(PROJECT_ROOT)}`)).body.data
+check(
+  'B88',
+  JSON.stringify(partialFileData.skills.map((row) => row.name)) === JSON.stringify(['readable']),
+  `读不到的文件应被安静跳过，实际 = ${JSON.stringify(partialFileData.skills.map((r) => r.name))}`,
+)
+
+// 没有 fs 服务时直读整体静默降级：注册表照常返回，不抛错、不编造。
+const noFsScanHost = makeHost({ noFs: true })
+hostModule.apply(noFsScanHost.ctx)
+const noFsScanResult = await getJson(noFsScanHost, '?sessionId=session-live')
+check('B89', noFsScanResult.status === 200 && noFsScanResult.body.data.skills.length === SKILLSET.length, `缺 fs 时应退回纯注册表读取，实际 ${noFsScanResult.status} / ${noFsScanResult.body.data.skills?.length}`)
+
+// ── 正文读取也必须认直读出来的那些 skill ──────────────────────────────────
+// 「列表里有、点开说没有」是最难看的失败形态：直读补进来的行**不在注册表里**，
+// `registry.get()` 必然返回 undefined。所以读取路径也要按同一套根目录规则回退。
+const readScanHost = makeHost({
+  existingPaths: [`${PROJECT_ROOT}/.git`],
+  skills: [],
+  dirs: { [PROJECT_AGENTS_ROOT]: [{ name: 'git-commit', type: 'directory' }, { name: 'gone', type: 'directory' }] },
+  files: { [`${PROJECT_AGENTS_ROOT}/git-commit/SKILL.md`]: md('git-commit', '提交代码') },
+})
+hostModule.apply(readScanHost.ctx)
+const readScanPost = await withEnv({ DSH_AGENTS_HOME: 'C:/agents' }, async () => {
+  const response = await readScanHost.routes[0].fetch(
+    POST({ op: 'read', name: 'git-commit', sessionId: 'session-live', cwd: PROJECT_ROOT }),
+  )
+  return { status: response.status, body: await response.json() }
+})
+check('B92', readScanPost.status === 200 && readScanPost.body.ok === true, `直读出来的 skill 读不到正文：${JSON.stringify(readScanPost.body).slice(0, 200)}`)
+check(
+  'B93',
+  typeof readScanPost.body.data?.content === 'string' &&
+    readScanPost.body.data.content.includes('提交代码') &&
+    readScanPost.body.data.content.includes('正文'),
+  `正文内容不对：${JSON.stringify(readScanPost.body.data?.content)}`,
+)
+check('B94', readScanPost.body.data?.path === `${PROJECT_AGENTS_ROOT}/git-commit/SKILL.md`, `正文的 path = ${JSON.stringify(readScanPost.body.data?.path)}`)
+// 注册表与直读**都没有**的名字仍然要如实 409 —— 回退不是"什么都给你读出来"。
+const readMissingPost = await withEnv({ DSH_AGENTS_HOME: 'C:/agents' }, async () => {
+  const response = await readScanHost.routes[0].fetch(
+    POST({ op: 'read', name: 'no-such-skill', sessionId: 'session-live', cwd: PROJECT_ROOT }),
+  )
+  return { status: response.status, body: await response.json() }
+})
+check('B95', readMissingPost.status === 409 && readMissingPost.body.ok === false, `找不到的 skill 应 409，实际 ${readMissingPost.status}`)
+// 文件读不到（`gone` 目录没有 SKILL.md）同样要 409，而不是编一段空正文。
+const readGonePost = await withEnv({ DSH_AGENTS_HOME: 'C:/agents' }, async () => {
+  const response = await readScanHost.routes[0].fetch(
+    POST({ op: 'read', name: 'gone', sessionId: 'session-live', cwd: PROJECT_ROOT }),
+  )
+  return { status: response.status, body: await response.json() }
+})
+check('B96', readGonePost.status === 409, `文件不在的 skill 应 409，实际 ${readGonePost.status}`)
+
+// 诊断字段**整体下线**：`providerFailures` 与 logger exporter 都不该再出现
+// （那是开发者看的内部原文，用户明确要求从界面上去掉；连带把这一路也删了）。
+const cleanResult = await getJson(baseHost)
+check('B90', cleanResult.body.data.providerFailures === undefined, `providerFailures 应已下线，实际 = ${JSON.stringify(cleanResult.body.data.providerFailures)}`)
+// 直读用的根目录必须与 `roots` 探测出来的**同一个** projectRoot —— 两边漂了，
+// 就会出现「标签页说目录存在、直读却去扫了别的地方」。
+const scanRootBySource = Object.fromEntries((scanData.roots ?? []).map((root) => [root.source, root]))
+check(
+  'B91',
+  scanRootBySource['project-agents']?.path === PROJECT_AGENTS_ROOT && scanRootBySource['project-dsh']?.path === PROJECT_DSH_ROOT,
+  `roots 里的项目根与直读用的根不一致：${JSON.stringify(scanRootBySource['project-agents']?.path)} / ${JSON.stringify(scanRootBySource['project-dsh']?.path)}`,
+)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // C 区：客户端半边协议
@@ -903,7 +1119,13 @@ check('D5', readyRender.text.includes('alpha'), '没有渲染 skill 名 alpha')
 // 只展开选中分组 → 这里断言的是**当前可见那条**的描述（gamma 属于未选中的「全局」）。
 check('D6', readyRender.text.includes('alpha 的描述'), '没有渲染选中分组里 skill 的描述')
 check('D7', readyRender.text.includes('共 2 个 skill'), `没有渲染计数，文本片段 = ${JSON.stringify(readyRender.text.slice(0, 200))}`)
-check('D8', readyRender.text.includes('当前会话（活 Agent）'), '没有把 resolvedBy 翻译成可读文案')
+// **诊断面板整体下线**（用户明确要求）：作用域 / 预设 / cwd / 项目根 / 提供方 / 完整性
+// 这一整行都不该再出现在页面上。它原本是给开发者排查用的，不是给使用者看的内容。
+check(
+  'D8',
+  ['作用域', '预设', '项目根', '提供方', '完整性'].every((label) => !readyRender.text.includes(label)),
+  `诊断面板还在渲染，文本片段 = ${JSON.stringify(readyRender.text.slice(0, 200))}`,
+)
 check('D9', !readyRender.text.includes('读取中…'), '就绪后仍停在「读取中…」')
 // 卡片与「查看」按钮必须一一对应——不绑定"一次渲染几组"，只绑定"每条 skill 都有入口"。
 const renderedCards = readyRender.hosts.filter((node) => node.props?.className === 'dskm-card')
@@ -959,8 +1181,10 @@ check('D16', expandedText.includes('收起'), '展开后按钮没有变成「收
 check('D17', expandRender.fetchCalls.some((call) => call.init?.method === 'POST'), '展开正文没有发 POST（正文应按需拉取，不跟列表一起下来）')
 
 // —— 空表 ——
+// 顶部那条「当前视图里没有发现任何 skill」已按用户要求删掉：它和标签页上的 `0`
+// 说的是同一件事。空状态的解释现在**只**出现在选中那一格里，一句话，不含路径。
 const emptyRender = await renderSection(async () => catalogResponse({ ...CATALOG, skills: [], counts: {} }))
-check('D18', emptyRender.text.includes('当前视图里没有发现任何 skill'), '空表没有渲染空态文案')
+check('D18', emptyRender.text.includes('没有发现 skill'), `空表没有渲染空态文案，文本片段 = ${JSON.stringify(emptyRender.text.slice(-160))}`)
 check('D19', emptyRender.text.includes('共 0 个 skill'), '空表计数不对')
 
 // —— 目录读取失败：同一条错误只允许一个渲染点 ——
@@ -970,25 +1194,37 @@ const errorOccurrences = failRender.text.split(ERROR_TEXT).length - 1
 check('D20', errorOccurrences === 1, `错误文案渲染了 ${errorOccurrences} 次，期望 1（同一错误只允许一个渲染点）`)
 check('D21', failRender.text.includes('刷新'), '失败态仍应有「刷新」按钮可以重试')
 
-// —— 发现未完成 ——
-// 「未完成」的泛化提示已去掉（用户反馈是重复噪声）：完整性的结论留在事实行里，
-// 可操作的原因走红色提供方原文。所以这里断言的是**两件事都成立才提示**。
-const partialRender = await renderSection(async () => catalogResponse({ ...CATALOG, complete: false }))
-check('D22', !partialRender.text.includes('本次发现未完成'), '没有失败记录时不应渲染「未完成」提示（会变成无信息量的噪声）')
+// —— 「完整性 未完成」与提供方原文：**整体下线** ——
+// 用户原话：「把冗余提示都去掉，这是作为使用者不用看到的内容」。
+// 所以这里反过来钉：即使宿主仍然回传 complete:false + providerFailures（旧宿主/未来宿主），
+// 页面上也不许出现「本次发现未完成」「候选被整体丢弃」这类开发者文案。
+const partialRender = await renderSection(async () =>
+  catalogResponse({
+    ...CATALOG,
+    complete: false,
+    providerFailures: {
+      filesystem: { message: "FsError: cannot list 'D:/…/app.asar/…': Cannot mix BigInt and other types", level: 'warn', at: 1 },
+    },
+  }),
+)
 check(
   'D62',
-  partialRender.text.includes('完整性') && partialRender.text.includes('未完成'),
-  'complete:false 时事实行里的「完整性」字段必须如实显示',
+  ['本次发现未完成', '候选被整体丢弃', 'FsError', 'Cannot mix BigInt', '未完成'].every((needle) => !partialRender.text.includes(needle)),
+  `未完成/提供方原文不该再渲染，文本片段 = ${JSON.stringify(partialRender.text.slice(0, 240))}`,
 )
-const partialWithFail = await renderSection(async () =>
-  catalogResponse({ ...CATALOG, complete: false, providerFailures: { filesystem: { message: 'boom', level: 'warn', at: 1 } } }),
-)
-check('D63', partialWithFail.text.includes('本次发现未完成'), '有失败记录 + 未完成时才渲染「未完成」提示')
+// 诊断下线了，但**列表本身照常渲染**——删掉的只是提示，不是数据。
+check('D63', partialRender.text.includes('alpha'), '去掉提示之后，列表本身必须照常渲染')
 
-// —— 降级到全局层：必须解释「为什么可能是空的」——
+// —— 降级到全局层：也不再提示 ——
+// 这条提示原本让用户「先打开一个会话再刷新」；直读上线后「只读全局层」不再等于空表，
+// 也就不再需要一句开发者视角的解释。
 const degradedRender = await renderSection(async () => catalogResponse({ ...CATALOG, skills: [], resolvedBy: 'global-layer', presetId: undefined, cwd: undefined }))
-check('D23', degradedRender.text.includes('仅全局层'), '降级时没有把 resolvedBy 说清楚')
-check('D24', degradedRender.text.includes('请先打开一个会话'), '降级时没有给出可操作的建议')
+check(
+  'D23',
+  ['仅全局层', '没有解析到 Agent 预设作用域'].every((needle) => !degradedRender.text.includes(needle)),
+  `降级提示不该再渲染，文本片段 = ${JSON.stringify(degradedRender.text.slice(0, 200))}`,
+)
+check('D24', degradedRender.text.includes('没有发现 skill'), '降级时空状态仍要有一句解释')
 
 // —— 没有主视图 session：不得编造 sessionId ——
 const noSessionRender = await renderSection(async () => catalogResponse({ ...CATALOG, skills: [] }), { byId: {} })
@@ -1008,12 +1244,23 @@ const emptyGroupsRender = await renderSection(async () =>
 for (const [id, label] of [['D27', '项目'], ['D28', '全局'], ['D29', '自定义'], ['D30', '随包内置']]) {
   check(id, emptyGroupsRender.text.includes(label), `skills 为空时没有渲染「${label}」分组标题`)
 }
-check('D31', emptyGroupsRender.text.includes('D:/project/.dsh/skills'), '没有渲染项目根目录的真实路径')
-check('D32', emptyGroupsRender.text.includes('不存在'), '没有渲染根目录的存在性')
+// **根目录路径与「存在/不存在」小字整体下线**：那一块是排查面板，不是使用者要看的内容。
+// 「空」仍然分得开三种原因，但只用一句话说，不再甩绝对路径。
+const ANY_ROOT_PATH = ['D:/project/.dsh/skills', 'D:/project/.agents/skills', 'C:/dsh/skills', 'C:/agents/skills']
+check(
+  'D31',
+  ANY_ROOT_PATH.every((path) => !emptyGroupsRender.text.includes(path)),
+  `页面上不该再出现根目录路径，文本片段 = ${JSON.stringify(emptyGroupsRender.text)}`,
+)
+check(
+  'D32',
+  !emptyGroupsRender.text.includes('未判定') && !emptyGroupsRender.text.includes('不存在'),
+  `不该再渲染「存在/不存在/未判定」标签，文本片段 = ${JSON.stringify(emptyGroupsRender.text)}`,
+)
 // 「项目 + 全局」已合并成一格：这一格里有 user-dsh（夹具里 exists:true），
-// 所以空状态该说"存在但里面没有合法的 skill"，而不是"都不存在"。
-check('D33', emptyGroupsRender.text.includes('根目录存在，但里面没有合法的 skill'), `空状态解释不对，文本片段 = ${JSON.stringify(emptyGroupsRender.text.slice(-200))}`)
-check('D34', emptyGroupsRender.text.includes('D:/project'), '没有渲染项目根')
+// 所以空状态该说"目录存在但里面没有合法的 skill"，而不是"都不存在"。
+check('D33', emptyGroupsRender.text.includes('目录存在，但里面没有合法的 skill'), `空状态解释不对，文本片段 = ${JSON.stringify(emptyGroupsRender.text.slice(-200))}`)
+check('D34', !emptyGroupsRender.text.includes('D:/project'), '项目根路径不该再渲染')
 
 // 全部根目录都不存在时，才该说"都不存在"——三种原因必须真的分得开。
 const allMissingRender = await renderSection(async () =>
@@ -1025,7 +1272,14 @@ const allMissingRender = await renderSection(async () =>
     roots: CATALOG.roots.map((root) => (root.path === undefined ? root : { ...root, exists: false })),
   }),
 )
-check('D50', allMissingRender.text.includes('上面这些根目录都不存在'), `全部缺失时的解释不对，文本片段 = ${JSON.stringify(allMissingRender.text.slice(-200))}`)
+check('D50', allMissingRender.text.includes('这些目录都还不存在'), `全部缺失时的解释不对，文本片段 = ${JSON.stringify(allMissingRender.text.slice(-200))}`)
+// D31 只覆盖了「目录存在」那一支的空状态；「都不存在」是**另一支**，路径同样不许泄漏。
+// 反向验证时发现的覆盖缺口：把路径拼进这一支，D31 看不见（两个分支不同时渲染）。
+check(
+  'D65',
+  ANY_ROOT_PATH.every((path) => !allMissingRender.text.includes(path)),
+  `「都不存在」那一支也不该出现根目录路径，文本片段 = ${JSON.stringify(allMissingRender.text.slice(-200))}`,
+)
 
 // —— 分组只以「标签页 + 个数」呈现，一次展开一个 ——
 // 规范标签页永远都列出来（含 0），所以「空」仍然一眼可见，但内容不堆叠。
@@ -1071,8 +1325,14 @@ check('D43', customTab !== undefined, '没找到「自定义」标签页')
 await customTab?.props?.onClick?.()
 const customMounted = await mount(emptyGroupsRender.runtime, emptyGroupsRender.component, emptyGroupsRender.props)
 const customText = textOf(customMounted.view)
-check('D44', customText.includes('由 Config.customSkillDirs 决定'), `点开「自定义」后没有渲染该根的说明，文本片段 = ${JSON.stringify(customText.slice(-260))}`)
-check('D45', !customText.includes('D:/project/.dsh/skills'), '只应展开选中的那一格，别的格的根目录不该还在')
+// 「自定义」根没有 `path`、也没有 `exists`（位置由配置决定）→ 三种空状态里的最后一种。
+check('D44', customText.includes('暂时读不到这些目录'), `点开「自定义」后没有给出空状态解释，文本片段 = ${JSON.stringify(customText.slice(-260))}`)
+// 切到「自定义」后，别的格（项目 + 全局）的根目录路径**任何形态**都不该还在。
+check(
+  'D45',
+  ANY_ROOT_PATH.every((path) => !customText.includes(path)) && customText.includes('自定义'),
+  `只应展开选中的那一格，别的格的痕迹不该还在，文本片段 = ${JSON.stringify(customText.slice(-260))}`,
+)
 
 // 默认标签页必须挑「非空」的：只有随包内置有内容时，就不该停在空的那一格上。
 const bundledOnly = await renderSection(async () =>
@@ -1172,29 +1432,40 @@ const readPostBody = readPost === undefined ? {} : JSON.parse(String(readPost.in
 check('D60', readPostBody?.cwd === 'D:/project/agent-go', `展开正文的 POST 没带选中的 cwd，实际 = ${JSON.stringify(readPostBody)}`)
 
 
-// —— 提供方被跳过的原文：这才是"为什么一个都没读到"的答案 ——
+// —— 提供方原文 / 提供方汇总：**整块下线**（用户要求「冗余提示都去掉」）——
+// 反面钉一次：旧宿主若仍然塞 `providerFailures`，页面上也不许出现任何内部原文。
+// 注意断言的是「这些字符串一个都不出现」，而不是"某一行不存在"——
+// 后者会随着排版变化而平凡通过。
 const FAIL_TEXT = "ENOENT: no such file or directory, scandir 'D:/.../app.asar/.../skills'"
 const providerFailRender = await renderSection(async () =>
   catalogResponse({
     ...CATALOG,
-    skills: [],
+    skills: [{ ...CATALOG.skills[0] }],
     counts: {},
-    providers: {},
+    providers: { filesystem: 1 },
     providerFailures: { filesystem: { message: FAIL_TEXT, level: 'warn', at: 1 } },
     complete: false,
   }),
 )
-check('D47', providerFailRender.text.includes('filesystem'), `没有渲染被跳过的提供方名，文本片段 = ${JSON.stringify(providerFailRender.text.slice(0, 320))}`)
-check('D48', providerFailRender.text.includes(FAIL_TEXT), '没有渲染提供方失败的**原文**——那正是排查所需的唯一信息')
-check('D49', providerFailRender.text.includes('候选被整体丢弃'), '没有说明"该提供方的候选被整体丢弃"这一后果？')
-// 旧宿主不带该字段时不能凭空报警。
-check('D52', !readyRender.text.includes('候选被整体丢弃'), '没有失败记录时不应渲染失败提示')
-
-// —— 提供方汇总：排查「完整性 未完成」的线索 ——
-check('D36', readyRender.text.includes('提供方') && readyRender.text.includes('filesystemx2'), `没有渲染提供方汇总，文本片段 = ${JSON.stringify(readyRender.text.slice(0, 300))}`)
+check(
+  'D47',
+  [FAIL_TEXT, 'FsError', '候选被整体丢弃', '本次发现未完成', '提供方', '完整性', 'filesystemx1'].every(
+    (needle) => !providerFailRender.text.includes(needle),
+  ),
+  `提供方失败相关文案都不该渲染，文本片段 = ${JSON.stringify(providerFailRender.text.slice(0, 320))}`,
+)
+check('D48', providerFailRender.text.includes('alpha'), '去掉诊断之后，列表本身必须照常渲染')
+check('D49', providerFailRender.text.includes('共 1 个 skill'), `计数必须照常渲染，文本片段 = ${JSON.stringify(providerFailRender.text.slice(0, 200))}`)
+// 就绪态里也不该有任何诊断痕迹。
+check(
+  'D52',
+  ['作用域', '完整性', '提供方', '候选被整体丢弃', '未完成'].every((needle) => !readyRender.text.includes(needle)),
+  `就绪态不该有诊断文案，文本片段 = ${JSON.stringify(readyRender.text.slice(0, 320))}`,
+)
 
 // —— 徽标显示**提供方**，不重复分组名 ——
 // 第一次实测里 `bundled` 徽标 + `随包内置` 分组并排出现，让人以为分类错了。
+// 徽标是**每一行**的归属提示，不是诊断面板，保留。
 const badgeTexts = readyRender.hosts.filter((node) => node.props?.className === 'dskm-badge').map(textOf)
 check('D37', badgeTexts.includes('filesystem'), `徽标文案 = ${JSON.stringify(badgeTexts)}，应显示提供方`)
 check('D38', !badgeTexts.some((text) => text === 'bundled' || text === 'project-dsh' || text === 'user-dsh'), `徽标不该重复分组名/source 名：${JSON.stringify(badgeTexts)}`)
