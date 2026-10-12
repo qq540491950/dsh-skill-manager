@@ -825,11 +825,19 @@ check('D2', readyRender.fetchCalls[0]?.url.includes('sessionId=session-1'), `fet
 check('D3', readyRender.text.includes('项目'), '没有渲染「项目」分组标题')
 check('D4', readyRender.text.includes('全局'), '没有渲染「全局」分组标题')
 check('D5', readyRender.text.includes('alpha'), '没有渲染 skill 名 alpha')
-check('D6', readyRender.text.includes('gamma 的描述'), '没有渲染 skill 描述')
+// 只展开选中分组 → 这里断言的是**当前可见那条**的描述（gamma 属于未选中的「全局」）。
+check('D6', readyRender.text.includes('alpha 的描述'), '没有渲染选中分组里 skill 的描述')
 check('D7', readyRender.text.includes('共 2 个 skill'), `没有渲染计数，文本片段 = ${JSON.stringify(readyRender.text.slice(0, 200))}`)
 check('D8', readyRender.text.includes('当前会话（活 Agent）'), '没有把 resolvedBy 翻译成可读文案')
 check('D9', !readyRender.text.includes('读取中…'), '就绪后仍停在「读取中…」')
-check('D10', readyRender.hosts.filter((n) => n.type === 'button' && textOf(n).includes('查看')).length === 2, '每条 skill 应各有一个「查看」按钮')
+// 卡片与「查看」按钮必须一一对应——不绑定"一次渲染几组"，只绑定"每条 skill 都有入口"。
+const renderedCards = readyRender.hosts.filter((node) => node.props?.className === 'dskm-card')
+const renderedViewButtons = readyRender.hosts.filter((node) => node.type === 'button' && textOf(node).includes('查看'))
+check(
+  'D10',
+  renderedCards.length > 0 && renderedViewButtons.length === renderedCards.length,
+  `卡片 ${renderedCards.length} 个、「查看」按钮 ${renderedViewButtons.length} 个，应一一对应`,
+)
 
 // hook 调用序必须每次渲染都一致（条件式 hook 是 React 里最致命的一类 bug）。
 const sectionInstance = [...readyRender.runtime.instances.entries()].find(([key]) => key.includes('#SkillSection'))?.[1]
@@ -839,7 +847,7 @@ check(
   sectionInstance !== undefined && sectionInstance.history.length >= 2 && sectionInstance.history.every((count) => count === sectionInstance.history[0]),
   `hook 位数在不同渲染间不一致：${JSON.stringify(sectionInstance?.history)} —— 存在条件式 hook`,
 )
-check('D13', sectionInstance?.history[0] === 6, `SkillSection 的 hook 位 = ${sectionInstance?.history[0]}，期望 6（useSessions + 3×useState + useEffect + useCallback）`)
+check('D13', sectionInstance?.history[0] === 7, `SkillSection 的 hook 位 = ${sectionInstance?.history[0]}，期望 7（useSessions + 4×useState + useEffect + useCallback）`)
 
 // —— 展开正文 ——
 const expandFetch = async (url, init) => {
@@ -918,7 +926,45 @@ check('D31', emptyGroupsRender.text.includes('D:/project/.dsh/skills'), '没有�
 check('D32', emptyGroupsRender.text.includes('不存在'), '没有渲染根目录的存在性')
 check('D33', emptyGroupsRender.text.includes('上面这些根目录都不存在'), `空分组没有解释为什么空，文本片段 = ${JSON.stringify(emptyGroupsRender.text.slice(0, 400))}`)
 check('D34', emptyGroupsRender.text.includes('D:/project'), '没有渲染项目根')
-check('D35', emptyGroupsRender.text.includes('由 Config.customSkillDirs 决定'), '没有渲染 custom 根的说明')
+
+// —— 分组只以「标签页 + 个数」呈现，一次展开一个 ——
+// 四个分组永远都列出来（含 0），所以「空」仍然一眼可见，但内容不堆叠。
+const tabButtons = (render) =>
+  render.hosts.filter((node) => {
+    const className = node.props?.className
+    return typeof className === 'string' && className.split(' ').includes('dskm-tab')
+  })
+const readyTabs = tabButtons(readyRender)
+check('D39', readyTabs.length === 4, `标签页数 = ${readyTabs.length}，期望 4`)
+check(
+  'D40',
+  ['项目1', '全局1', '自定义0', '随包内置0'].every((label) => readyTabs.some((node) => textOf(node) === label)),
+  `标签页文案 = ${JSON.stringify(readyTabs.map(textOf))}，每个标签都要带个数（含 0）`,
+)
+// 默认落在第一个非空分组：一进来就有内容可看，不会停在空标签页上。
+check('D41', readyRender.text.includes('alpha'), '默认标签页应显示第一个非空分组（项目）的内容')
+check('D42', !readyRender.text.includes('gamma'), '未选中的分组内容不应同时渲染（这正是要消掉的堆叠）')
+
+// 点空分组：必须给出「为什么空」的解释，且不再渲染别的分组的 skill。
+const customTab = emptyGroupsRender.hosts.find(
+  (node) => typeof node.props?.className === 'string' && node.props.className.split(' ').includes('dskm-tab') && textOf(node).startsWith('自定义'),
+)
+check('D43', customTab !== undefined, '没找到「自定义」标签页')
+await customTab?.props?.onClick?.()
+const customMounted = await mount(emptyGroupsRender.runtime, emptyGroupsRender.component, emptyGroupsRender.props)
+const customText = textOf(customMounted.view)
+check('D44', customText.includes('由 Config.customSkillDirs 决定'), `点开「自定义」后没有渲染该根的说明，文本片段 = ${JSON.stringify(customText.slice(-260))}`)
+check('D45', !customText.includes('D:/project/.dsh/skills'), '只应展开选中的那个分组，别的分组的根目录不该还在')
+
+// 默认标签页必须挑「非空」的：只有随包内置有内容时，就不该停在空的「项目」上。
+const bundledOnly = await renderSection(async () =>
+  catalogResponse({
+    ...CATALOG,
+    skills: [{ name: 'office-docx', description: 'docx', source: 'bundled', group: 'bundled', provider: 'dsh-office', modelInvocable: true }],
+    counts: { project: 0, global: 0, custom: 0, bundled: 1, other: 0 },
+  }),
+)
+check('D46', bundledOnly.text.includes('office-docx'), '只有 bundled 有内容时，默认应落在「随包内置」标签页上')
 
 // —— 提供方汇总：排查「完整性 未完成」的唯一线索 ——
 check('D36', readyRender.text.includes('提供方') && readyRender.text.includes('filesystemx2'), `没有渲染提供方汇总，文本片段 = ${JSON.stringify(readyRender.text.slice(0, 300))}`)
