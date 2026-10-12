@@ -971,8 +971,19 @@ check('D20', errorOccurrences === 1, `错误文案渲染了 ${errorOccurrences} 
 check('D21', failRender.text.includes('刷新'), '失败态仍应有「刷新」按钮可以重试')
 
 // —— 发现未完成 ——
+// 「未完成」的泛化提示已去掉（用户反馈是重复噪声）：完整性的结论留在事实行里，
+// 可操作的原因走红色提供方原文。所以这里断言的是**两件事都成立才提示**。
 const partialRender = await renderSection(async () => catalogResponse({ ...CATALOG, complete: false }))
-check('D22', partialRender.text.includes('本次发现未完成'), 'complete:false 没有渲染「发现未完成」提示')
+check('D22', !partialRender.text.includes('本次发现未完成'), '没有失败记录时不应渲染「未完成」提示（会变成无信息量的噪声）')
+check(
+  'D62',
+  partialRender.text.includes('完整性') && partialRender.text.includes('未完成'),
+  'complete:false 时事实行里的「完整性」字段必须如实显示',
+)
+const partialWithFail = await renderSection(async () =>
+  catalogResponse({ ...CATALOG, complete: false, providerFailures: { filesystem: { message: 'boom', level: 'warn', at: 1 } } }),
+)
+check('D63', partialWithFail.text.includes('本次发现未完成'), '有失败记录 + 未完成时才渲染「未完成」提示')
 
 // —— 降级到全局层：必须解释「为什么可能是空的」——
 const degradedRender = await renderSection(async () => catalogResponse({ ...CATALOG, skills: [], resolvedBy: 'global-layer', presetId: undefined, cwd: undefined }))
