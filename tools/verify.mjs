@@ -192,9 +192,27 @@ const SKILLSET = [
   skill('eta', 'user-agents', { modelInvocable: false, userInvocable: false }),
 ]
 
+/** 临时改环境变量并跑一段异步逻辑。根目录路径由 env 决定，测试必须自己控制。 */
+async function withEnv(vars, run) {
+  const saved = new Map()
+  for (const [key, value] of Object.entries(vars)) {
+    saved.set(key, process.env[key])
+    if (value === undefined) delete process.env[key]
+    else process.env[key] = value
+  }
+  try {
+    return await run()
+  } finally {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+}
+
 /** 搭一套宿主替身；每个成员都记录自己的调用，断言才有「实际发生了什么」可看。 */
 function makeHost(options = {}) {
-  const calls = { snapshot: [], scopedSnapshot: [], get: [], scopedGet: [], acquireScope: [], observeSession: [], serviceFor: [] }
+  const calls = { snapshot: [], scopedSnapshot: [], get: [], scopedGet: [], acquireScope: [], observeSession: [], serviceFor: [], lstat: [] }
   const fixtures = options.skills ?? SKILLSET
   const contents = options.contents ?? {}
 
@@ -276,10 +294,21 @@ function makeHost(options = {}) {
         }
 
   const routes = []
+  const existingPaths = options.existingPaths ?? []
+  /** 抽象 fs 替身：只认给定的存在路径；`noFs` 时整个服务缺席。 */
+  const fs = options.noFs === true
+    ? undefined
+    : {
+        async lstat(target) {
+          calls.lstat.push(target)
+          if (options.fsThrows === true) throw new Error('sandbox denied')
+          return existingPaths.includes(target) ? { isDirectory: true } : undefined
+        },
+      }
   const scope = {
     skills,
     get(name) {
-      return { agentPresets: presets, agents, sessionQuery, workspaceRegistry: undefined }[name]
+      return { agentPresets: presets, agents, sessionQuery, workspaceRegistry: undefined, fs }[name]
     },
     connection: {
       fetch: {
@@ -296,7 +325,7 @@ function makeHost(options = {}) {
     },
     get: scope.get,
   }
-  return { ctx, routes, calls, lease, observation, liveAgent, scopedRegistry, skills }
+  return { ctx, routes, calls, lease, observation, liveAgent, scopedRegistry, skills, fs }
 }
 
 const hostModule = await import(new URL('../lib/index.js', import.meta.url).href)
@@ -434,6 +463,64 @@ const bigBody = await bigResponse.json()
 check('B50', bigBody.data.truncated === true, '超长正文没有标记 truncated')
 check('B51', bigBody.data.content.length === 200_000, `截断长度 = ${bigBody.data.content.length}，期望 200000`)
 check('B52', bigBody.data.contentLength === bigContent.length, `contentLength = ${bigBody.data.contentLength}`)
+
+// —— 规范根目录探测：让「0 个」可解释（第一次实测暴露的直接问题）——
+// 必须带 sessionId：项目根是从 session 的权威 cwd 往上找 `.git` 得来的，
+// 没有 session 就没有 cwd，也就没有项目根（见下面的 B66）。
+const rootsOptions = { existingPaths: ['D:/project/.git', 'C:/dsh/skills'] }
+const rootsHost = makeHost(rootsOptions)
+hostModule.apply(rootsHost.ctx)
+const rootsResult = await withEnv(
+  { DSH_HOME: 'C:/dsh', DSH_AGENTS_HOME: 'C:/agents', USERPROFILE: 'C:/home' },
+  () => getJson(rootsHost, '?sessionId=session-live'),
+)
+const rootsData = rootsResult.body.data
+const rootBySource = Object.fromEntries((rootsData.roots ?? []).map((root) => [root.source, root]))
+check('B53', rootsData.projectRoot === 'D:/project', `projectRoot = ${JSON.stringify(rootsData.projectRoot)}（应从 cwd 向上找到含 .git 的祖先）`)
+check('B54', Array.isArray(rootsData.roots) && rootsData.roots.length === 6, `roots 条数 = ${rootsData.roots?.length}，期望 6`)
+check('B55', rootBySource['project-dsh']?.path === 'D:/project/.dsh/skills', `project-dsh path = ${JSON.stringify(rootBySource['project-dsh']?.path)}`)
+check('B56', rootBySource['project-dsh']?.exists === false, `project-dsh exists = ${JSON.stringify(rootBySource['project-dsh']?.exists)}`)
+check('B57', rootBySource['project-agents']?.path === 'D:/project/.agents/skills', `project-agents path = ${JSON.stringify(rootBySource['project-agents']?.path)}`)
+check('B58', rootBySource['user-dsh']?.path === 'C:/dsh/skills', `user-dsh path = ${JSON.stringify(rootBySource['user-dsh']?.path)}`)
+check('B59', rootBySource['user-dsh']?.exists === true, `user-dsh exists = ${JSON.stringify(rootBySource['user-dsh']?.exists)}`)
+check('B60', rootBySource['user-agents']?.path === 'C:/agents/skills', `user-agents path = ${JSON.stringify(rootBySource['user-agents']?.path)}`)
+check('B61', rootBySource.custom?.note !== undefined && rootBySource.custom?.path === undefined, 'custom 根的位置由配置决定，不该假装知道路径')
+check('B62', rootBySource.bundled?.note !== undefined, 'bundled 根应给出说明')
+// 提供方汇总是排查「完整性 未完成」的唯一线索。
+check('B63', rootsData.providers?.filesystem === SKILLSET.length, `providers = ${JSON.stringify(rootsData.providers)}`)
+
+// 没有 cwd 就没有项目根：必须如实为 undefined，不能拿工作区列表瞎猜（见 B39 同一条纪律）。
+const noCwdHost = makeHost(rootsOptions)
+hostModule.apply(noCwdHost.ctx)
+const noCwdResult = await withEnv({ DSH_HOME: 'C:/dsh', USERPROFILE: 'C:/home' }, () => getJson(noCwdHost))
+const noCwdRoot = Object.fromEntries((noCwdResult.body.data.roots ?? []).map((root) => [root.source, root]))
+check('B66', noCwdResult.body.data.projectRoot === undefined, `无 cwd 时 projectRoot = ${JSON.stringify(noCwdResult.body.data.projectRoot)}，应如实为 undefined`)
+check('B67', noCwdRoot['project-dsh']?.path === undefined, '无 cwd 时项目根路径不应编造')
+
+// 没有 fs 服务时必须是「未判定」，不能报成「不存在」——把权限/能力问题说成"你没装"是误报。
+const noFsHost = makeHost({ ...rootsOptions, noFs: true })
+hostModule.apply(noFsHost.ctx)
+const noFsResult = await withEnv(
+  { DSH_HOME: 'C:/dsh', DSH_AGENTS_HOME: 'C:/agents', USERPROFILE: 'C:/home' },
+  () => getJson(noFsHost, '?sessionId=session-live'),
+)
+const noFsRoot = Object.fromEntries((noFsResult.body.data.roots ?? []).map((root) => [root.source, root]))['project-dsh']
+check('B64', noFsRoot?.exists === undefined, `没有 fs 服务时 exists = ${JSON.stringify(noFsRoot?.exists)}，应为 undefined（未判定）`)
+
+// 根目录探测失败绝不能把整次目录读取带下去。
+// 注意这里断言的是**三件事**：目录读取照常成功、roots 仍有 6 条、存在性为「未判定」。
+// 只断言"状态 200 + skills 还在"是不够的——`pathExists` 自己吞掉异常时，
+// 外层的兜底 catch 永远跑不到，那条断言会**平凡通过**（第一次写就是这么假通过的）。
+const fsThrowsHost = makeHost({ ...rootsOptions, fsThrows: true })
+hostModule.apply(fsThrowsHost.ctx)
+const fsThrowsResult = await withEnv({ DSH_HOME: 'C:/dsh', DSH_AGENTS_HOME: 'C:/agents', USERPROFILE: 'C:/home' }, () =>
+  getJson(fsThrowsHost, '?sessionId=session-live'),
+)
+const fsThrowsData = fsThrowsResult.body.data
+const fsThrowsRoot = Object.fromEntries((fsThrowsData.roots ?? []).map((root) => [root.source, root]))
+check('B65', fsThrowsResult.status === 200 && fsThrowsData.skills.length === SKILLSET.length, 'fs 抛错时目录读取仍应成功返回')
+check('B68', fsThrowsData.roots?.length === 6, `fs 抛错时 roots 条数 = ${fsThrowsData.roots?.length}，仍应给出 6 条（存在性降级为未判定，而不是整块消失）`)
+check('B69', fsThrowsRoot['project-dsh']?.exists === undefined, `fs 抛错时 exists = ${JSON.stringify(fsThrowsRoot['project-dsh']?.exists)}，应为 undefined（未判定）`)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // C 区：客户端半边协议
@@ -711,10 +798,20 @@ const catalogResponse = (payload) => ({ status: 200, json: async () => ({ ok: tr
 
 const CATALOG = {
   skills: [
-    { name: 'alpha', description: 'alpha 的描述', source: 'project-dsh', group: 'project', modelInvocable: true, path: 'C:/skills/alpha/SKILL.md' },
-    { name: 'gamma', description: 'gamma 的描述', source: 'user-dsh', group: 'global', modelInvocable: true, path: 'C:/skills/gamma/SKILL.md' },
+    { name: 'alpha', description: 'alpha 的描述', source: 'project-dsh', group: 'project', provider: 'filesystem', modelInvocable: true, path: 'C:/skills/alpha/SKILL.md' },
+    { name: 'gamma', description: 'gamma 的描述', source: 'user-dsh', group: 'global', provider: 'filesystem', modelInvocable: true, path: 'C:/skills/gamma/SKILL.md' },
   ],
   counts: { project: 1, global: 1, custom: 0, bundled: 0, other: 0 },
+  providers: { filesystem: 2 },
+  roots: [
+    { group: 'project', source: 'project-dsh', path: 'D:/project/.dsh/skills', exists: false },
+    { group: 'project', source: 'project-agents', path: 'D:/project/.agents/skills', exists: false },
+    { group: 'global', source: 'user-dsh', path: 'C:/dsh/skills', exists: true },
+    { group: 'global', source: 'user-agents', path: 'C:/agents/skills', exists: false },
+    { group: 'custom', source: 'custom', note: '由 Config.customSkillDirs 决定' },
+    { group: 'bundled', source: 'bundled', note: '随包分发 / 运行时注册' },
+  ],
+  projectRoot: 'D:/project',
   complete: true,
   resolvedBy: 'session-agent',
   presetId: 'preset-cordis',
@@ -807,6 +904,30 @@ check(
   noSessionRender.fetchCalls.every((call) => !call.url.includes('sessionId=')),
   `没有主视图 session 时不应编造 sessionId：${JSON.stringify(noSessionRender.fetchCalls.map((c) => c.url))}`,
 )
+
+// —— 空目录也必须能看到「项目 / 全局」两组 ——
+// 这是第一次真实实测暴露的直接问题：只渲染非空分组时，用户看到一片空白，
+// 分不清"本机没有 skill"和"这个分组根本没实现"。
+const emptyGroupsRender = await renderSection(async () =>
+  catalogResponse({ ...CATALOG, skills: [], counts: {}, providers: {} }),
+)
+for (const [id, label] of [['D27', '项目'], ['D28', '全局'], ['D29', '自定义'], ['D30', '随包内置']]) {
+  check(id, emptyGroupsRender.text.includes(label), `skills 为空时没有渲染「${label}」分组标题`)
+}
+check('D31', emptyGroupsRender.text.includes('D:/project/.dsh/skills'), '没有渲染项目根目录的真实路径')
+check('D32', emptyGroupsRender.text.includes('不存在'), '没有渲染根目录的存在性')
+check('D33', emptyGroupsRender.text.includes('上面这些根目录都不存在'), `空分组没有解释为什么空，文本片段 = ${JSON.stringify(emptyGroupsRender.text.slice(0, 400))}`)
+check('D34', emptyGroupsRender.text.includes('D:/project'), '没有渲染项目根')
+check('D35', emptyGroupsRender.text.includes('由 Config.customSkillDirs 决定'), '没有渲染 custom 根的说明')
+
+// —— 提供方汇总：排查「完整性 未完成」的唯一线索 ——
+check('D36', readyRender.text.includes('提供方') && readyRender.text.includes('filesystemx2'), `没有渲染提供方汇总，文本片段 = ${JSON.stringify(readyRender.text.slice(0, 300))}`)
+
+// —— 徽标显示**提供方**，不重复分组名 ——
+// 第一次实测里 `bundled` 徽标 + `随包内置` 分组并排出现，让人以为分类错了。
+const badgeTexts = readyRender.hosts.filter((node) => node.props?.className === 'dskm-badge').map(textOf)
+check('D37', badgeTexts.includes('filesystem'), `徽标文案 = ${JSON.stringify(badgeTexts)}，应显示提供方`)
+check('D38', !badgeTexts.some((text) => text === 'bundled' || text === 'project-dsh' || text === 'user-dsh'), `徽标不该重复分组名/source 名：${JSON.stringify(badgeTexts)}`)
 
 // ─────────────────────────────────────────────────────────────────────────────
 

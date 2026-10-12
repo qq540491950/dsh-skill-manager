@@ -168,6 +168,20 @@ const skills = (await skillRegistry.list({ cwd, scope })).filter(isUserInvocable
       "resourceKind": "directory"    // 可选
     }],
     "counts": { "project": 0, "global": 0, "custom": 3, "bundled": 0, "other": 0 },
+    // 按提供方汇总。`complete:false` 时这是唯一能指向"是谁没交作业"的线索。
+    "providers": { "filesystem": 3, "dsh-office": 3 },
+    // 规范根目录清单：真实路径 + 存在性（true/false/undefined=未判定）。
+    // 没有它，「分组是空的」和「分组没实现」在界面上看不出区别。
+    "roots": [
+      { "group": "project", "source": "project-dsh", "path": "D:/project/demo/.dsh/skills", "exists": false },
+      { "group": "project", "source": "project-agents", "path": "D:/project/demo/.agents/skills", "exists": false },
+      { "group": "global", "source": "user-dsh", "path": "C:/Users/admin/.dsh/skills", "exists": false },
+      { "group": "global", "source": "user-agents", "path": "C:/Users/admin/.agents/skills", "exists": true },
+      // 这两个根的位置由配置决定，宿主读不到展开后的值 → 只给说明，不编路径。
+      { "group": "custom", "source": "custom", "note": "由 Config.customSkillDirs 决定" },
+      { "group": "bundled", "source": "bundled", "note": "随包分发 / 运行时注册" }
+    ],
+    "projectRoot": "D:/project",     // 从 cwd 向上找到的含 .git 的祖先；无 cwd 时为 undefined
     "complete": true,               // false = 某根目录扫描失败/未完成，列表可能不完整
     "resolvedBy": "session-agent",   // session-agent | preset-lease | global-layer
     "presetId": "cordis",           // 可选
@@ -233,21 +247,65 @@ const skills = (await skillRegistry.list({ cwd, scope })).filter(isUserInvocable
 | `source` / `provider` 被官方 Remote 裁掉 | 同文件 `:163-169` |
 | 座位声明在 `sidebar.settings.children` 里，未声明的座位直接 register 会抛错 | `dsh-client-ui-settings-general/lib/client.js:1136-1139` |
 | `navIcon(id)` 硬编码查表、未知 id 兜底齿轮 | 同文件 `:244-270` |
-| 本插件自身：**141/141 断言全绿**，且 **10/10 反向验证**逐条精确报错 | `node tools/verify.mjs` |
+| 挂载后 `dsh --profile web --patch <改后的补丁文件> --dump-config` 仍 exit 0（真实 Loader 接受该文件） | 见 §6 |
+| **页面在真实 GUI 里渲染成功**：设置导航出现「Skills」；`resolvedBy=session-agent`、`presetId=cordis`、`cwd` 正确 | 用户 2026-10-12 实测截图 |
+| **本机确实没有项目/全局 skill**：`.dsh/skills`、`.agents/skills`（项目侧）与 `~/.dsh/skills` 都不存在，`~/.agents/skills` 存在但为空 | 直接列目录 |
+| **`dsh-skill-office` 显式以 `source:"bundled"` 注册**（不是文件系统根） | `dsh-skill-office/lib/index.js:71` + `BUNDLED_SKILL_RANK` |
+| 本插件自身：**170/170 断言全绿**，且 **17/17 反向验证**逐条精确报错 | `node tools/verify.mjs` |
+
+### 7.1.1 第一次实测发现的上游问题（**不是本插件的 bug**）
+
+截图里 `完整性 未完成`、且只有 4 个 `bundled` skill、看不到 preset 自带的
+`cordis-plugin-development` 等 —— 这是 profile 里 `skill-filesystem` 的
+`customSkillDirs` 解析失败：
+
+```js
+// cordis.yml 的 cordis preset 段（第 1330-1336 行）
+customSkillDirs:
+  - !!js >-
+    process.getBuiltinModule('node:path').join(
+      process.getBuiltinModule('node:path').dirname(
+        process.getBuiltinModule('node:module').createRequire(baseUrl)
+          .resolve('@deepseek-ai/dsh-agent-preset/package.json')),
+      'skills')
+```
+
+复现（假设 `baseUrl` = profile 的 `cordis.yml` URL）：
+
+```
+createRequire('file:///C:/Users/admin/.dsh/profiles/desktop/cordis.yml')
+  .resolve('@deepseek-ai/dsh-agent-preset/package.json')
+  → MODULE_NOT_FOUND
+```
+
+因为 profile 的 `node_modules/@deepseek-ai` 里只有 `cosmokit / dsh-web-search-exa /
+schemastery`，从 profile 目录逐级向上都找不到 `dsh-agent-preset`。
+
+**独立佐证**（不依赖 `baseUrl` 的假设）：本会话的 `skill` 工具加载
+`cordis-plugin-development` 返回 `unknown or no longer available`
+—— 活的 skill 目录里确实没有它。所以 `完整性 未完成` 是本插件**如实报出**了
+这个上游状态。修不修、怎么修属于 profile 配置，本插件不越界。
+
+### 7.1.2 第一次实测发现的本插件缺陷（已修）
+
+| 缺陷 | 现象 | 修法 |
+|---|---|---|
+| **只渲染非空分组** | 本机没有项目/全局 skill，于是「项目」「全局」两节**整块消失**，用户看到一片空白，判断为"没有全局和项目的管理" | 四个规范分组**永远渲染**（`other` 除外），各带真实根目录路径与存在性 |
+| 徽标重复分组名 | `bundled` 徽标与「随包内置」分组并排，让人以为分类错了 | 徽标改显示**提供方**（`dsh-office` / `filesystem`） |
+| `未完成` 不可操作 | 只说"某个根目录扫描失败"，不知道是哪个 | 新增「提供方」汇总行；期望的文件系统提供方不在里面就是它的根没扫成功 |
 
 ### 7.2 未实测（不要当成已完成）
 
 | 项 | 为什么没测 | 怎么补 |
 |---|---|---|
-| **页面在真实 GUI 里的样子** | 插件还没接线；接线要改 profile + 重启 DSH，两件事都得你决定 | 接线并重启后，打开 设置 → Skills |
-| **宿主路由真跑 `ctx.skills.snapshot()`** | 同上。自检里跑的是替身 | 接线后 `curl` 一次 `/api/skill-manager`，或看页面 |
-| **`agentPresets.acquireScope(默认 preset)` 在本 profile 是否成功** | 只能在活宿主里验证。若失败会优雅降级成 `global-layer`（空表 + 提示），不会崩 | 不选 session 直接看页面 |
-| **活 Agent 路径（`resolvedBy: session-agent`）** | 需要真实活跃会话 | 打开一个会话后看「作用域」那一行 |
-| **`useSessions` 回调在真实 store 上的行为** | 自检里是假 store；「主视图 session」判据抄自官方 6 处用点 | 打开页面确认「视图」里有 sessionId |
-| **深浅两套主题下的实际观感** | 同上 | 切换主题看一遍 |
+| **修复后的页面（170/170 这一次）** | 新增的 `roots`/`providers`/`projectRoot` 由**宿主**产出，而宿主半边不热重载 —— 必须重启 DSH 才看得到 | 重启 DSH 后看 设置 → Skills |
+| **`ctx.fs` 在真实宿主里对工作区外路径的行为** | 自检里是替身。真实沙箱可能拒绝 `lstat` 工作区之外的路径 → 存在性会显示「未判定」而不是「不存在」 | 重启后看根目录那一栏；全是「未判定」就是这个原因 |
+| **`agentPresets.acquireScope(默认 preset)` 在本 profile 是否成功** | 实测走的是活 Agent 路径（已成功），冷读租约那条一次都没被触发 | 不选 session 直接看页面 |
+| **preset 自带 skill 能否恢复** | 取决于上游 `customSkillDirs` 的修复（见 7.1.1） | 修好 profile 后「自定义」分组会出现内容 |
+| **深浅两套主题下的实际观感** | 主题切换未测 | 切换主题看一遍 |
 | `B52` 截断边界之外的超大正文 | 只测了 200010 字符一例 | 可选 |
 
-**安装与座位注册本身不等于"用户能看见"。** 上面这些在接线前都保持"未实测"。
+**安装与座位注册本身不等于"用户能看见"。** 没有实测的部分必须明说。
 
 ---
 
