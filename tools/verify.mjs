@@ -822,25 +822,37 @@ function patchFetch(handler, fetchCalls) {
   }
 }
 
+/** 默认工作区清单：一项有 title，一项只有路径（正好试 lastSegment 兜底）。 */
+const MAIN_WORKSPACE_STATE = {
+  items: [
+    { workspaceId: 'w-1', path: 'D:/project/agent-go', title: 'agent-go', sessionIds: [], createdAt: 1 },
+    { workspaceId: 'w-2', path: 'D:/project/ECC/', title: '', sessionIds: [], createdAt: 2 },
+  ],
+}
+
 /**
  * 在假 fetch（与假 sessions 快照）下真渲染一次 SkillSection。
  *
  * 每次都**重新加载一遍 bundle**，把本 runtime 的 react 交给它——这样组件里的 hooks
  * 才是真的（见 loadClientModule 的注释）。
  */
-async function renderSection(fetchHandler, sessionState = MAIN_SESSION_STATE) {
+async function renderSection(fetchHandler, sessionState = MAIN_SESSION_STATE, workspaceState = MAIN_WORKSPACE_STATE) {
   const runtime = createRuntime()
   const mod = loadClientModule(runtime.react)
   const component = applyClient(mod.exportsObj).registrations[0].component
   const fetchCalls = []
   patchFetch(fetchHandler, fetchCalls)
   try {
-    // useSessions 也占一个 hook 位，这样 hook 计数与真实运行时同形。
+    // useSessions / useWorkspaces 都各占一个 hook 位，这样 hook 计数与真实运行时同形。
     const useSessions = (selector) => {
       runtime.state.current.index++
       return selector(sessionState)
     }
-    const props = { useSessions }
+    const useWorkspaces = (selector) => {
+      runtime.state.current.index++
+      return selector(workspaceState)
+    }
+    const props = { useSessions, useWorkspaces }
     const mounted = await mount(runtime, component, props)
     return {
       runtime,
@@ -910,7 +922,7 @@ check(
   sectionInstance !== undefined && sectionInstance.history.length >= 2 && sectionInstance.history.every((count) => count === sectionInstance.history[0]),
   `hook 位数在不同渲染间不一致：${JSON.stringify(sectionInstance?.history)} —— 存在条件式 hook`,
 )
-check('D13', sectionInstance?.history[0] === 7, `SkillSection 的 hook 位 = ${sectionInstance?.history[0]}，期望 7（useSessions + 4×useState + useEffect + useCallback）`)
+check('D13', sectionInstance?.history[0] === 9, `SkillSection 的 hook 位 = ${sectionInstance?.history[0]}，期望 9（useSessions + useWorkspaces + 4×useState + useEffect + useCallback）`)
 
 // —— 展开正文 ——
 const expandFetch = async (url, init) => {
@@ -1060,6 +1072,94 @@ const bundledOnly = await renderSection(async () =>
   }),
 )
 check('D46', bundledOnly.text.includes('office-docx'), '只有 bundled 有内容时，默认应落在「随包内置」标签页上')
+
+// ── 范围选择：看当前会话，还是看某个工作区的 skill ──────────────────────────
+// 这是"跨项目看 skill"的入口。宿主侧 `options.cwd` 本来就优先于 session 的权威 cwd，
+// 所以客户端只要把选中的工作区路径带上即可。
+check(
+  'D53',
+  ['当前会话', 'agent-go（agent-go）', 'ECC（ECC）'].every((label) => readyRender.text.includes(label)),
+  `没有渲染范围选择器或工作区选项，文本片段 = ${JSON.stringify(readyRender.text.slice(0, 260))}`,
+)
+// 没有 title 的工作区必须兜底成路径最后一段（夹具里 ECC 的 title 是空串、path 带尾斜杠）。
+check('D54', readyRender.text.includes('ECC（ECC）'), '无 title 的工作区没有兜底成路径最后一段')
+
+// 选中一个工作区 → 请求必须带上 `cwd=<工作区路径>`，否则换项目就是摆设。
+const switchedRender = await renderSection(async (url) => catalogResponse(CATALOG))
+const workspaceOption = switchedRender.hosts.find(
+  (node) => node.type === 'select' || (typeof node.props?.className === 'string' && node.props.className.split(' ').includes('dskm-select')),
+)
+check('D55', workspaceOption !== undefined, '没找到范围下拉框')
+// 后续所有触发/挂载都必须在**假 fetch 装着**的窗口内做：客户端的 ROUTE 是同源相对路径，
+// 漏到 Node 的原生 fetch 会直接抛错（踩过：表现为"切换之后什么也没发生"）。
+const withFakeFetch = async (run) => {
+  patchFetch(switchedRender.fetchHandler, switchedRender.fetchCalls)
+  try {
+    return await run()
+  } finally {
+    globalThis.fetch = REAL_FETCH
+  }
+}
+// onChange 的值是工作区路径；空串表示"当前会话"。
+await withFakeFetch(async () => {
+  await workspaceOption?.props?.onChange?.({ target: { value: 'D:/project/ECC' } })
+  await mount(switchedRender.runtime, switchedRender.component, switchedRender.props)
+})
+check(
+  'D56',
+  switchedRender.fetchCalls.some((call) => call.url.includes('cwd=D%3A%2Fproject%2FECC')),
+  `切换工作区后请求没带 cwd，实际 = ${JSON.stringify(switchedRender.fetchCalls.map((c) => c.url))}`,
+)
+// 首屏（还没切）必须**不带** cwd：当前会话的 cwd 由宿主权威解析，客户端不掺和。
+check('D57', switchedRender.fetchCalls[0]?.url.includes('cwd=') === false, `首屏不应带 cwd，实际 = ${JSON.stringify(switchedRender.fetchCalls[0]?.url)}`)
+// 而且历史上也不该出现过 `cwd=null` 这种字符串（把 null 当路径发出去是真 bug）。
+check(
+  'D61',
+  switchedRender.fetchCalls.every((call) => !call.url.includes('cwd=null')),
+  `不应把 null 当 cwd 发出去：${JSON.stringify(switchedRender.fetchCalls.map((c) => c.url))}`,
+)
+
+// 切回「当前会话」→ cwd 又消失。
+await withFakeFetch(async () => {
+  await workspaceOption?.props?.onChange?.({ target: { value: '' } })
+  await mount(switchedRender.runtime, switchedRender.component, switchedRender.props)
+})
+check(
+  'D58',
+  switchedRender.fetchCalls[switchedRender.fetchCalls.length - 1]?.url.includes('cwd=') === false,
+  '切回「当前会话」后不应再带 cwd',
+)
+
+// 展开正文也必须带同一个 cwd，否则会出现「列表里有、点开说没有」。
+const readWithCwd = await renderSection(async (url, init) => {
+  if (init?.method === 'POST') {
+    return { status: 200, json: async () => ({ ok: true, data: { name: 'alpha', path: 'p', content: '正文', truncated: false, contentLength: 2 } }) }
+  }
+  return catalogResponse(CATALOG)
+})
+check('D59', readWithCwd.hosts.some((n) => n.type === 'button' && textOf(n).includes('查看')), '没找到「查看」按钮（cwd 用例的前置）')
+patchFetch(readWithCwd.fetchHandler, readWithCwd.fetchCalls)
+try {
+  // 先选一个工作区，再点「查看」：POST 必须带上同一个 cwd。
+  await readWithCwd.hosts
+    .find((node) => typeof node.props?.className === 'string' && node.props.className.split(' ').includes('dskm-select'))
+    ?.props?.onChange?.({ target: { value: 'D:/project/agent-go' } })
+  await mount(readWithCwd.runtime, readWithCwd.component, readWithCwd.props)
+  // ⚠️ 必须在 mount 之后**重新找**按钮：事件闭包捕获的是当次渲染的 pickedCwd，
+  // 拿着切换前抓到的旧节点去点，等于用旧闭包点——测的是过去而不是现在。
+  const freshButton = hostsOf(renderTree(readWithCwd.runtime, readWithCwd.runtime.react.createElement(readWithCwd.component, readWithCwd.props))).find(
+    (n) => n.type === 'button' && textOf(n).includes('查看'),
+  )
+  await freshButton?.props?.onClick?.()
+} finally {
+  globalThis.fetch = REAL_FETCH
+}
+await mount(readWithCwd.runtime, readWithCwd.component, readWithCwd.props)
+const readPost = readWithCwd.fetchCalls.find((call) => call.init?.method === 'POST')
+// ⚠️ 别用 JSON.stringify(…).includes(…)：JSON 会把 `/` 转义成 `\/`，永远匹配不上。
+const readPostBody = readPost === undefined ? {} : JSON.parse(String(readPost.init?.body ?? '{}'))
+check('D60', readPostBody?.cwd === 'D:/project/agent-go', `展开正文的 POST 没带选中的 cwd，实际 = ${JSON.stringify(readPostBody)}`)
+
 
 // —— 提供方被跳过的原文：这才是"为什么一个都没读到"的答案 ——
 const FAIL_TEXT = "ENOENT: no such file or directory, scandir 'D:/.../app.asar/.../skills'"

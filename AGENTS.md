@@ -21,7 +21,7 @@ skill，按来源分组（项目 / 全局 / 自定义 / 随包内置）。**第�
 **唯一必跑的命令**：
 
 ```powershell
-node tools/verify.mjs      # 期望 PASS 177/177
+node tools/verify.mjs      # 期望 PASS 200/200
 ```
 
 **设计依据、已实测/未实测清单、证据出处**：`README.md`（第 3 节作用域解析、第 7 节实测状态、第 9 节 asar 解包）。
@@ -127,6 +127,22 @@ node tools/verify.mjs      # 期望 PASS 177/177
 > 地方，都必须把假 `fetch` 装着（D 区踩过：点击发生在假 fetch 已被还原之后，
 > 报出 `Failed to parse URL from "/api/skill-manager"`）。
 
+### 2.8 跨项目的 `cwd` 必须显式归一化：`null` 不是"不传"
+
+范围下拉用 `""` 表示"当前会话"，用 `null` 表示"还没选过"。这两者都必须转成"不传"——
+`fetchCatalog` 里 `cwd !== undefined` 的判断会把字符串 `"null"` 当路径发出去，
+宿主会去扫一个名叫 `null` 的项目根。（D61 钉这条，实测抓到过。）
+
+> 副作用：只在用户显式切换了项目时才传 `cwd`。不传时宿主自己从 session header
+> 取权威 cwd——那是唯一可信的来源（见 2.4）。
+
+### 2.9 范围选择的数据源是 root kit 的 `useWorkspaces`
+
+`settings.section` 是 `scope: "root"`，所以页组件能拿到 root kit 的 `useWorkspaces`
+（活台账 `standardProps` 已确认）。快照形状来自 `ui-workspace/lib/client.js:434`：
+每项 `{ workspaceId, path, title, sessionIds, createdAt }`——`path` 决定扫哪个项目，
+`title` 可能是**空串**（用路径最后一段兜底）。
+
 ---
 
 ## 3. UI 纪律
@@ -229,7 +245,7 @@ node tools/verify.mjs
 
 故意注入违规、确认断言能**精确**报错——**然后还原**。
 
-本次记录（20/20 通过）。反向验证里有**五个**容易自欺的陷阱，都必须避开：
+本次记录（30/30 通过）。反向验证里有**五个**容易自欺的陷阱，都必须避开：
 
 1. **注入点会崩掉自检进程** → 断言根本来不及打印，看起来像"没报错"。
    例：直接注入 `scope.configEditor.edit();` 会在 `apply` 期间抛错、整进程崩掉。
@@ -250,16 +266,30 @@ node tools/verify.mjs
 推荐的注入面（B9 丢 scope / B10 不释放租约 / B18 不用权威 cwd / B33 误加过滤 /
 A11 出现写入 API / A24 硬编码颜色 / A7 bundle id / D2 不发 sessionId / D12 条件式 hook /
 D28 过滤空分组 / D31 不渲染根目录路径 / D36 去掉提供方汇总 / D40 标签页不带个数 /
-D44 标签页点不动 / D46 默认不挑非空分组 / B53 不走 .git 祖先 /
-B54 不返回 roots / B64 未判定误报为不存在 / B68 探测出错就整块丢掉）。
+D44 标签页点不动 / D46 默认不挑非空分组 / D53 不渲染范围下拉 / D56 换项目不带 cwd /
+D61 把 null 当 cwd 发出去 / D60 正文不带 cwd / B53 不走 .git 祖先 /
+B54 不返回 roots / B64 未判定误报为不存在 / B68 探测出错就整块丢掉 /
+B70 不挂 exporter / B71 不声明 levels / B72 前缀不匹配）。
 
-### 4.4 断言报错时，先判断是**断言错了**还是**代码错了**
+> ⚠️ **锚点会随代码过期**：每轮重构之后，上一轮的注入锚点可能已不存在
+> （`if (sessionId !== undefined) params.set(...)`、`buildTabs` 取代 buckets 都发生过）。
+> 跑反向验证时如果报「锚点出现 0 次」，先改用例再下结论。
+
+### 4.5 测交互时，**事件闭包是当次渲染的**
+
+`onChange` / `onClick` 闭包捕获的是**那一次渲染**的状态。先抓按钮节点、再触发状态变更、
+最后用旧节点去点 —— 测的是过去。**必须在状态变更 + 重新 mount 之后重新查一遍 DOM。**
+（D60 踩过：拿着切换前抓的「查看」按钮去点，POST 里没有 cwd。）
+
+另外：JSON 断言别用 `stringify(…).includes(...)`——JSON 会把 `/` 转义成 `\/`，永远匹配不上。
+
+### 4.6 断言报错时，先判断是**断言错了**还是**代码错了**
 
 例：B39 原本断言"无 sessionId 时 cwd 也等于某个路径"——那是断言错，
 因为此时宿主**确实**拿不到权威 cwd，如实报 `undefined` 才是对的。改断言要说明理由，
 并保留原有的防护意图。
 
-### 4.5 不要为了让断言通过而放宽断言
+### 4.7 不要为了让断言通过而放宽断言
 
 如果断言拦住了你的改动，先判断是断言过严还是改动错了。
 

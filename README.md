@@ -148,7 +148,14 @@ const skills = (await skillRegistry.list({ cwd, scope })).filter(isUserInvocable
 
 ### `GET ?sessionId=<id>&preset=<id>&cwd=<path>`
 
-三个查询参数都可选；`sessionId` 是唯一重要的那个。
+三个查询参数都可选。
+
+- `sessionId` 决定 **scope**（活 Agent → 用它当 scope；否则 `acquireScope()` 冷读租约）。
+- `cwd` 只在**用户显式切换了项目**时才由客户端传（范围下拉选中某个工作区），
+  它决定扫哪个项目根；此时它**优先于** session header 的权威 cwd。
+  不传 = 当前会话，宿主自己取权威 cwd。
+- 客户端把 `null`/空串都转成"不传"——曾经把字符串 `"null"` 当路径发出去，
+  宿主会去扫一个叫 `null` 的项目根（D61 钉这条）。
 
 ```jsonc
 {
@@ -294,6 +301,9 @@ schemastery`，从 profile 目录逐级向上都找不到 `dsh-agent-preset`。
 | 徽标重复分组名 | `bundled` 徽标与「随包内置」分组并排，让人以为分类错了 | 徽标改显示**提供方**（`dsh-office` / `filesystem`） |
 | `未完成` 不可操作 | 只说"某个根目录扫描失败"，不知道是哪个 | 新增「提供方」汇总行；期望的文件系统提供方不在里面就是它的根没扫成功 |
 | 四组内容平铺 | 四个分组各自铺开、还各带一行根目录说明，一屏放不下；而且未接到新宿主时显示的是 `<projectRoot>` 这类**占位符**，又长又没信息量 | 改为**标签页 + 个数**：四个分组永远列出（含 `0`），一次只展开一个；根目录说明跟着选中分组走。默认落在**第一个非空**分组上，不会一进来就停在空标签页 |
+| 项目/全局各占一格 | 两格都空，还得点两次才确认"真的没有" | 合并成一格「项目 + 全局」，一次看全四个根目录 |
+| **无法跨项目看 skill** | `projectRoot` 等于当前会话的 cwd，`ECC` / `agent-go` 的 `.agents/skills` 不在本会话的扫描范围内 | 新增**范围下拉**：列出 DSH 的工作区（`useWorkspaces`，root kit 自带），选中即把该路径作为 `cwd` 传给宿主。管道本来就在——宿主的 `options.cwd` 本来就优先于 session 的权威 cwd |
+| **读到失败却不上报** | `skill-filesystem` 的 `list()` 循环没有 per-root try/catch，一个根目录抛错 → 整个提供方的候选被丢弃 → 表现为"全是 0 + 未完成 + filesystem 不在提供方列表里"。而 warn 进不了宿主内置日志缓冲，**原因不可见** | 宿主挂 `ctx.logger.exporter({ levels: { default: 3 } })`，按 `skill provider "<name>" skipped:` 收原文，随 `providerFailures` 下发并渲染成红色提示 |
 
 ### 7.2 未实测（不要当成已完成）
 
