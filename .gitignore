@@ -1,0 +1,46 @@
+# 依赖
+node_modules/
+.pnpm-store/
+
+# 构建产物 / 缓存
+dist/
+build/
+out/
+*.tsbuildinfo
+.cache/
+
+# 测试与覆盖率
+coverage/
+
+# 打包产物
+*.tgz
+*.tar.gz
+
+# 日志
+*.log
+logs/
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# 临时文件
+tmp/
+.tmp/
+*.local
+
+# 编辑器 / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.iml
+
+# 操作系统
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+desktop.ini
