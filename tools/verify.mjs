@@ -216,10 +216,33 @@ function makeHost(options = {}) {
   const fixtures = options.skills ?? SKILLSET
   const contents = options.contents ?? {}
 
+  /**
+   * 假 logger：捕获 exporter 注册，并允许测试**在读取过程中**把日志打进去。
+   * 时序很关键——`readCatalog` 每次读取开始都会清空失败记录，所以"读取前先打日志"
+   * 会被正确地清掉，模拟不出真实场景（提供方是在 list() 期间抛错并打日志的）。
+   */
+  const exporters = []
+  const logger = {
+    exporter(config) {
+      exporters.push(config)
+      return () => {}
+    },
+  }
+  const emitLog = (line, type = 'warn') => {
+    for (const exporter of exporters) exporter.export({ args: [line], type, ts: 1 })
+  }
+
   /** 两个注册表（全局的 / preset 组内的）行为一致，只是记账通道不同。 */
   const registry = (recordSnapshot, recordGet) => ({
     async snapshot(o) {
       recordSnapshot(o)
+      // 真实时序：提供方 list() 抛错 → dsh-skill 打 warn → 候选被整体丢弃、complete=false。
+      // `onSnapshot` 让测试能在**读取过程中**打任意日志，这是验证"只认该前缀"的唯一办法
+      // （读取前打的日志会被 readCatalog 正常清掉，那样断言会平凡通过）。
+      if (typeof options.onSnapshot === 'function') options.onSnapshot(emitLog)
+      if (options.providerFailure !== undefined) {
+        emitLog(`skill provider "filesystem" skipped: ${options.providerFailure}`)
+      }
       return { skills: options.skills ?? SKILLSET, complete: options.complete ?? true }
     },
     async get(name, o) {
@@ -307,6 +330,8 @@ function makeHost(options = {}) {
       }
   const scope = {
     skills,
+    // cordis 内置服务（不需要 inject 声明）。
+    logger: options.noLogger === true ? undefined : logger,
     get(name) {
       return { agentPresets: presets, agents, sessionQuery, workspaceRegistry: undefined, fs }[name]
     },
@@ -325,7 +350,7 @@ function makeHost(options = {}) {
     },
     get: scope.get,
   }
-  return { ctx, routes, calls, lease, observation, liveAgent, scopedRegistry, skills, fs }
+  return { ctx, routes, calls, lease, observation, liveAgent, scopedRegistry, skills, fs, exporters, emitLog }
 }
 
 const hostModule = await import(new URL('../lib/index.js', import.meta.url).href)
@@ -521,6 +546,44 @@ const fsThrowsRoot = Object.fromEntries((fsThrowsData.roots ?? []).map((root) =>
 check('B65', fsThrowsResult.status === 200 && fsThrowsData.skills.length === SKILLSET.length, 'fs 抛错时目录读取仍应成功返回')
 check('B68', fsThrowsData.roots?.length === 6, `fs 抛错时 roots 条数 = ${fsThrowsData.roots?.length}，仍应给出 6 条（存在性降级为未判定，而不是整块消失）`)
 check('B69', fsThrowsRoot['project-dsh']?.exists === undefined, `fs 抛错时 exists = ${JSON.stringify(fsThrowsRoot['project-dsh']?.exists)}，应为 undefined（未判定）`)
+
+// ── 提供方被跳过的原文 ────────────────────────────────────────────────────
+// `dsh-skill/lib/index.js:354` 在某个提供方 list() 抛错时打
+// `skill provider "<name>" skipped: <detail>`，然后把这个提供方的候选**全部丢掉**。
+// 这就是「项目/全局/自定义都是 0，但完整性是未完成，而提供方列表里没有 filesystem」的答案。
+const PROVIDER_ERROR = "ENOENT: no such file or directory, scandir 'D:/.../app.asar/.../skills'"
+const failHost = makeHost({ providerFailure: PROVIDER_ERROR, complete: false })
+hostModule.apply(failHost.ctx)
+const failResult = await getJson(failHost, '?sessionId=session-live')
+check('B70', failHost.exporters.length === 1, `注册了 ${failHost.exporters.length} 个 logger exporter，期望 1`)
+// 内置 exporter 正是**没声明 levels** 才把 warn 丢掉（见 dsh-mcp-manager 的实测），必须显式拉满。
+check('B71', failHost.exporters[0]?.levels?.default === 3, `exporter levels = ${JSON.stringify(failHost.exporters[0]?.levels)}，必须是 { default: 3 }`)
+const failure = failResult.body.data.providerFailures
+check('B72', failure?.filesystem?.message === PROVIDER_ERROR, `providerFailures = ${JSON.stringify(failure)}`)
+check('B73', failure?.filesystem?.level === 'warn', `level = ${JSON.stringify(failure?.filesystem?.level)}`)
+check('B74', Object.keys(failure).length === 1, `只应记录被跳过的那个提供方，实际 ${JSON.stringify(Object.keys(failure))}`)
+
+// 没有失败就不能编造（否则这行会变成噪声，用户学会无视它）
+const cleanResult = await getJson(baseHost)
+check('B75', Object.keys(cleanResult.body.data.providerFailures ?? {}).length === 0, `没有失败时应为空对象，实际 ${JSON.stringify(cleanResult.body.data.providerFailures)}`)
+
+// 只认该前缀：别的 warn（哪怕也提到 skill）不能入账。日志在**读取过程中**打，才绕不开清空逻辑。
+const noisyHost = makeHost({
+  onSnapshot: (log) => {
+    log('something unrelated happened')
+    log('skill "x" from y ignored because a higher-priority skill already exists')
+    log('mcp-client(foo): connection attempt failed')
+  },
+})
+hostModule.apply(noisyHost.ctx)
+const noisyResult = await getJson(noisyHost, '?sessionId=session-live')
+check('B76', Object.keys(noisyResult.body.data.providerFailures ?? {}).length === 0, `无关日志不应入账，实际 ${JSON.stringify(noisyResult.body.data.providerFailures)}`)
+
+// 没有 logger 服务时优雅降级，而不是抛错
+const noLoggerHost = makeHost({ noLogger: true })
+hostModule.apply(noLoggerHost.ctx)
+const noLoggerResult = await getJson(noLoggerHost, '?sessionId=session-live')
+check('B77', noLoggerResult.status === 200 && noLoggerResult.body.ok === true, `缺 logger 时应正常工作，实际 ${noLoggerResult.status}`)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // C 区：客户端半边协议
@@ -924,28 +987,60 @@ for (const [id, label] of [['D27', '项目'], ['D28', '全局'], ['D29', '自定
 }
 check('D31', emptyGroupsRender.text.includes('D:/project/.dsh/skills'), '没有渲染项目根目录的真实路径')
 check('D32', emptyGroupsRender.text.includes('不存在'), '没有渲染根目录的存在性')
-check('D33', emptyGroupsRender.text.includes('上面这些根目录都不存在'), `空分组没有解释为什么空，文本片段 = ${JSON.stringify(emptyGroupsRender.text.slice(0, 400))}`)
+// 「项目 + 全局」已合并成一格：这一格里有 user-dsh（夹具里 exists:true），
+// 所以空状态该说"存在但里面没有合法的 skill"，而不是"都不存在"。
+check('D33', emptyGroupsRender.text.includes('根目录存在，但里面没有合法的 skill'), `空状态解释不对，文本片段 = ${JSON.stringify(emptyGroupsRender.text.slice(-200))}`)
 check('D34', emptyGroupsRender.text.includes('D:/project'), '没有渲染项目根')
 
+// 全部根目录都不存在时，才该说"都不存在"——三种原因必须真的分得开。
+const allMissingRender = await renderSection(async () =>
+  catalogResponse({
+    ...CATALOG,
+    skills: [],
+    counts: {},
+    providers: {},
+    roots: CATALOG.roots.map((root) => (root.path === undefined ? root : { ...root, exists: false })),
+  }),
+)
+check('D50', allMissingRender.text.includes('上面这些根目录都不存在'), `全部缺失时的解释不对，文本片段 = ${JSON.stringify(allMissingRender.text.slice(-200))}`)
+
 // —— 分组只以「标签页 + 个数」呈现，一次展开一个 ——
-// 四个分组永远都列出来（含 0），所以「空」仍然一眼可见，但内容不堆叠。
+// 规范标签页永远都列出来（含 0），所以「空」仍然一眼可见，但内容不堆叠。
 const tabButtons = (render) =>
   render.hosts.filter((node) => {
     const className = node.props?.className
     return typeof className === 'string' && className.split(' ').includes('dskm-tab')
   })
 const readyTabs = tabButtons(readyRender)
-check('D39', readyTabs.length === 4, `标签页数 = ${readyTabs.length}，期望 4`)
+// 项目 + 全局**合并成一格**（用户要求）：3 格而不是 4 格。
+check('D39', readyTabs.length === 3, `标签页数 = ${readyTabs.length}，期望 3（项目+全局 / 自定义 / 随包内置）`)
 check(
   'D40',
-  ['项目1', '全局1', '自定义0', '随包内置0'].every((label) => readyTabs.some((node) => textOf(node) === label)),
-  `标签页文案 = ${JSON.stringify(readyTabs.map(textOf))}，每个标签都要带个数（含 0）`,
+  ['项目 + 全局2', '自定义0', '随包内置0'].every((label) => readyTabs.some((node) => textOf(node) === label)),
+  `标签页文案 = ${JSON.stringify(readyTabs.map(textOf))}，每格都要带个数（含 0），且项目+全局必须合并且计数相加`,
 )
-// 默认落在第一个非空分组：一进来就有内容可看，不会停在空标签页上。
-check('D41', readyRender.text.includes('alpha'), '默认标签页应显示第一个非空分组（项目）的内容')
-check('D42', !readyRender.text.includes('gamma'), '未选中的分组内容不应同时渲染（这正是要消掉的堆叠）')
+// 默认落在第一个非空标签页：一进来就有内容可看，不会停在空标签页上。
+check('D41', readyRender.text.includes('alpha'), '默认标签页应显示第一个非空标签页（项目 + 全局）的内容')
+check('D42', readyRender.text.includes('gamma'), '合并后「项目 + 全局」里 project 与 global 的 skill 应同时可见')
 
-// 点空分组：必须给出「为什么空」的解释，且不再渲染别的分组的 skill。
+// 未选中标签页的内容不得同时渲染——这才是要消掉的堆叠。
+const mixedRender = await renderSection(async () =>
+  catalogResponse({
+    ...CATALOG,
+    skills: [
+      ...CATALOG.skills,
+      { name: 'office-docx', description: 'docx', source: 'bundled', group: 'bundled', provider: 'dsh-office', modelInvocable: true },
+    ],
+    counts: { project: 1, global: 1, custom: 0, bundled: 1, other: 0 },
+  }),
+)
+check(
+  'D51',
+  mixedRender.text.includes('alpha') && !mixedRender.text.includes('office-docx'),
+  `只应展开选中的那一格，别的格的内容不该同时渲染，文本片段 = ${JSON.stringify(mixedRender.text.slice(-260))}`,
+)
+
+// 点空标签页：必须给出「为什么空」的解释，且不再渲染别的格的 skill。
 const customTab = emptyGroupsRender.hosts.find(
   (node) => typeof node.props?.className === 'string' && node.props.className.split(' ').includes('dskm-tab') && textOf(node).startsWith('自定义'),
 )
@@ -954,9 +1049,9 @@ await customTab?.props?.onClick?.()
 const customMounted = await mount(emptyGroupsRender.runtime, emptyGroupsRender.component, emptyGroupsRender.props)
 const customText = textOf(customMounted.view)
 check('D44', customText.includes('由 Config.customSkillDirs 决定'), `点开「自定义」后没有渲染该根的说明，文本片段 = ${JSON.stringify(customText.slice(-260))}`)
-check('D45', !customText.includes('D:/project/.dsh/skills'), '只应展开选中的那个分组，别的分组的根目录不该还在')
+check('D45', !customText.includes('D:/project/.dsh/skills'), '只应展开选中的那一格，别的格的根目录不该还在')
 
-// 默认标签页必须挑「非空」的：只有随包内置有内容时，就不该停在空的「项目」上。
+// 默认标签页必须挑「非空」的：只有随包内置有内容时，就不该停在空的那一格上。
 const bundledOnly = await renderSection(async () =>
   catalogResponse({
     ...CATALOG,
@@ -966,7 +1061,25 @@ const bundledOnly = await renderSection(async () =>
 )
 check('D46', bundledOnly.text.includes('office-docx'), '只有 bundled 有内容时，默认应落在「随包内置」标签页上')
 
-// —— 提供方汇总：排查「完整性 未完成」的唯一线索 ——
+// —— 提供方被跳过的原文：这才是"为什么一个都没读到"的答案 ——
+const FAIL_TEXT = "ENOENT: no such file or directory, scandir 'D:/.../app.asar/.../skills'"
+const providerFailRender = await renderSection(async () =>
+  catalogResponse({
+    ...CATALOG,
+    skills: [],
+    counts: {},
+    providers: {},
+    providerFailures: { filesystem: { message: FAIL_TEXT, level: 'warn', at: 1 } },
+    complete: false,
+  }),
+)
+check('D47', providerFailRender.text.includes('filesystem'), `没有渲染被跳过的提供方名，文本片段 = ${JSON.stringify(providerFailRender.text.slice(0, 320))}`)
+check('D48', providerFailRender.text.includes(FAIL_TEXT), '没有渲染提供方失败的**原文**——那正是排查所需的唯一信息')
+check('D49', providerFailRender.text.includes('候选被整体丢弃'), '没有说明"该提供方的候选被整体丢弃"这一后果？')
+// 旧宿主不带该字段时不能凭空报警。
+check('D52', !readyRender.text.includes('候选被整体丢弃'), '没有失败记录时不应渲染失败提示')
+
+// —— 提供方汇总：排查「完整性 未完成」的线索 ——
 check('D36', readyRender.text.includes('提供方') && readyRender.text.includes('filesystemx2'), `没有渲染提供方汇总，文本片段 = ${JSON.stringify(readyRender.text.slice(0, 300))}`)
 
 // —— 徽标显示**提供方**，不重复分组名 ——
