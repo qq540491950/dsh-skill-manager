@@ -277,8 +277,21 @@ profile 的 `customSkillDirs` 指向 `app.asar` 内的 `<agent-preset>/skills`�
 `desktop` profile（`application: applied`、`warnings: []`），所以"装得上"**已实测**；
 但"宿主半边的新代码真的在跑"仍需重启 DSH，**页面表现始终未实测**。
 
-**当前源码是 `0.4.0`（只读形态，见第 0 节那条回退）**：**没装、没重启**——
-profile 里现在跑的还是带开关的 `0.3.0`。要让它生效：按 6.4 就地装新 spec，然后重启一次 DSH。
+**当前源码 `0.4.0`（只读形态，见第 0 节那条回退）已装进 profile**（2026-10-27）：
+`install_bundle(target: 'D:\project\dsh-plugins\dsh-skill-manager')` → `application: applied`、
+`warnings: []`、`version: 0.4.0`，profile 依赖变成 **`link:D:/project/dsh-plugins/dsh-skill-manager`**。
+两层含义：① 以后改完 `src/**` 只 `npm run build` 就够（不用重装）；② **但宿主半边仍要重启 DSH**，
+所以"页面真的变干净了"这件事仍**未实测**（AGENTS 1.3：重启由用户决定）。
+
+> 换 spec 的坑（实测）：同名包已装时 `install_bundle` 直接报 `already-installed` 并给出
+> `remove_bundle first` 的 nextStep —— 顺序必须是 ① `remove_bundle(target: 包名)` →
+> ② `install_bundle(target: 新 spec)`。中间那一瞬插件是**不在**的（页面会消失），
+> 第二步失败了要立刻按旧 spec 装回去。
+>
+> 链接形态另有一条 pnpm 警告：`peerDependencies` 里的 `@deepseek-ai/cordis` 不会从目标
+> `node_modules` 解析。对本插件**无害**——宿主产物零 import、只用注入进来的 Service，
+> 这条 peer 纯粹是声明。
+
 `npm publish` 仍未做（本机 `npm whoami` → `ENEEDAUTH`）。写文档时不许把"装完就能用"写成已验证。
 
 ---
@@ -618,7 +631,7 @@ effect 里的数据链是 `async/await` + `.then(setState)`。只 `await` 一个
 | `listTokens` 不是完整 token 表 | 它只列需要 light/dark 双份覆写的 alias 子集；判断 token 是否存在以官方 CSS 用法为准 |
 | 宿主日志基本不可看 | 要靠自检 + 渲染测试兜住，不能靠"跑起来看看" |
 | **`lib/**` 是生成物** | 源码在 `src/**`，改完必须 `npm run build`。手改 `lib/**` 会被下一次构建覆盖，且 E 区 + CI 的 `git diff --exit-code -- lib` 会红（见 2.11） |
-| **bundle 已真装过、包未发布、页面表现未实测** | `v0.2.0` / `v0.3.0` 都装进过 `desktop` profile（`application: applied`），但"装完页面真的对"从未实测（宿主半边要重启）。当前源码 `0.4.0` 还没装。`npm publish` 仍未做（本机 `npm whoami` → `ENEEDAUTH`）。见 2.12 |
+| **bundle 已真装过、包未发布、页面表现未实测** | `v0.2.0` / `v0.3.0`（git spec）与 `0.4.0`（`link:` 本地目录）都装进过 `desktop` profile（`application: applied`），但"装完页面真的对"从未实测（宿主半边要重启）。`npm publish` 仍未做（本机 `npm whoami` → `ENEEDAUTH`）。见 2.12 |
 | **包图标渲染未见** | `assets/icon.svg` 只是 bundle 清单字段；座位注册字段白名单里没有 `icon`（3.4），它不进导航图标。界面里实际什么样**没看过** |
 | **上游 provider 会被一个坏根目录整条拖死** | `dsh-skill-filesystem.list()` 没有 per-root try/catch。**本插件用直读兜底（见 2.10），但那不等于上游修好了**：`customSkillDirs`（本机指向 app.asar 内的 `<agent-preset>/skills`）仍然读不出来，「自定义」分组因此仍可能是 0。修它属于 profile 配置，不归本插件。 |
 | **直读的 frontmatter 解析是子集** | 宿主半边零 import，拿不到官方的 `yaml` 包，只实现了 `key: value` / 块标量 / 引号标量。比官方严格或宽松的写法都会导致「少列」或「多列」。因此**逐条对齐官方的硬性要求**（B80），并且**宁可漏也不编**。 |

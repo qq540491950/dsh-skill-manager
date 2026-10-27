@@ -396,7 +396,7 @@ lib  cordis.patch.yml  locale/*.json  assets/icon.svg  README.md  LICENSE
 |---|---|
 | 包改造（字段 / patch 层 / locale / icon / LICENSE / CI） | 已完成；静态断言在 P 区 |
 | 真装进 profile | **已实测**（2026-10-27）：`github:qq540491950/dsh-skill-manager#v0.2.0` → `application: applied`、`warnings: []`，profile 依赖 `0.1.0 → 0.2.0`；随后 `#v0.3.0` 同样 applied（`0.2.1 → 0.3.0`）。但**装完的页面表现未实测**（宿主半边要重启，见 §8） |
-| 当前源码版本（`0.4.0`，只读形态） | **未装、未重启**：profile 里跑的还是 `0.3.0`（带开关那一版）。要让它生效得按 §6.4 就地装 `#v0.4.0`，然后重启一次 DSH |
+| 当前源码版本（`0.4.0`，只读形态） | **已装**（2026-10-27）：`install_bundle(target: 'D:\project\dsh-plugins\dsh-skill-manager')` → `application: applied`、`warnings: []`、`version: 0.4.0`，profile 依赖变成 `link:D:/project/dsh-plugins/dsh-skill-manager`。**宿主半边未重启**，所以页面表现仍未实测。换 spec 前必须先 `remove_bundle`（同名已装时 `install_bundle` 报 `already-installed`） |
 | `npm publish` | **未做**：本机 `npm whoami` → `ENEEDAUTH`（未登录） |
 | 图标在界面里的观感 | **未见**：`icon` 只进 bundle 清单，座位注册不吃它 |
 
@@ -530,7 +530,7 @@ skill 读回来。（`自定义` 那一格仍受上游影响，因为它指向�
 | **preset 自带 skill 能否恢复** | 取决于上游 `customSkillDirs` 的修复（见 7.1.1） | 修好 profile 后「自定义」分组会出现内容 |
 | **深浅两套主题下的实际观感** | 主题切换未测 | 切换主题看一遍 |
 | `B52` 截断边界之外的超大正文 | 只测了 200010 字符一例 | 可选 |
-| **`0.4.0`（只读形态）在真实 GUI 里的表现** | 撤掉开关后的产物只在自检的迷你渲染器里跑过；宿主半边变了，要 `npm run build` + 重启 DSH 才看得到（见 §8）。而且 profile 里现在装的是 `0.3.0`（带开关那版），源码目录的路径行不参与 bundle 运行 | 按 §6.4 就地装 `#v0.4.0` → 重启 DSH → 看 设置 → Skills 每行只剩「名字 + 描述 + 徽标 + 查看」 |
+| **`0.4.0`（只读形态）在真实 GUI 里的表现** | 撤掉开关后的产物只在自检的迷你渲染器里跑过；**宿主半边没重启**（§8），而且换装前必须先 `remove_bundle`（见 §6.7）。profile 里现在是 `link:` 到本仓库的 `0.4.0` | 重启 DSH → 看 设置 → Skills 每行只剩「名字 + 描述 + 徽标 + 查看」 |
 | **`npm publish` / 按 registry 名再装一次** | 本机 `npm whoami` → `ENEEDAUTH`，没有登录 | 登录后 `npm publish --access public`，再 `install_bundle` 包名复验 |
 | **`npm pack` 的实际内容** | 没跑（清单见 §6.6） | `npm pack` + 解包逐项对照 §6.6 |
 | **包图标在界面里的渲染** | 没看过：`icon` 只进 bundle 清单，座位注册字段里没有它 | 装好后看插件列表/卡片里的图标 |
