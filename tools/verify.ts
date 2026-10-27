@@ -1762,6 +1762,7 @@ interface CatalogSkill {
   group: string
   provider: string
   modelInvocable: boolean
+  userInvocable?: boolean
   path?: string
 }
 
@@ -2168,6 +2169,41 @@ check(
 const badgeTexts = readyRender.hosts.filter((node) => node.props?.className === 'dskm-badge').map(textOf)
 check('D37', badgeTexts.includes('filesystem'), `徽标文案 = ${JSON.stringify(badgeTexts)}，应显示提供方`)
 check('D38', !badgeTexts.some((text) => text === 'bundled' || text === 'project-dsh' || text === 'user-dsh'), `徽标不该重复分组名/source 名：${JSON.stringify(badgeTexts)}`)
+
+// —— 「模型看不到它」必须**照实说**：两条独立通道不能合并成一句话 ——
+// 官方那两个键是分开的：`disable-model-invocation: true` 只挡模型，`user-invocable: false`
+// 还挡人手 `/名字`。旧文案一律写「仅用户可调用」，遇到两个键都关的 skill（本机
+// `~/.dsh/skills/ask-matt` 就是）就是假话——把"你能 / 调它"说成事实，比不说话更糟。
+const HINT_CATALOG: CatalogPayload = {
+  ...CATALOG,
+  skills: [
+    { name: 'alpha', description: '两条通道都开着', source: 'user-dsh', group: 'global', provider: 'filesystem', modelInvocable: true, userInvocable: true },
+    { name: 'beta', description: '只关了模型调用', source: 'user-dsh', group: 'global', provider: 'filesystem', modelInvocable: false, userInvocable: true },
+    { name: 'delta', description: '两个键都关了', source: 'user-dsh', group: 'global', provider: 'filesystem', modelInvocable: false, userInvocable: false },
+  ],
+  counts: { project: 0, global: 3, custom: 0, bundled: 0, other: 0 },
+}
+const hintRender = await renderSection(async () => catalogResponse(HINT_CATALOG))
+/** 某一行（`li.dskm-card`）里的全部文本；找不到就当空串，让断言报出干净失败。 */
+const cardTextOf = (name: string): string => {
+  const card = hintRender.hosts.find((node) => node.props?.className === 'dskm-card' && textOf(node).includes(name))
+  return card === undefined ? '' : textOf(card)
+}
+const hintBadges = hintRender.hosts
+  .filter((node) => node.props?.className === 'dskm-badge')
+  .map(textOf)
+  .filter((text) => text.includes('可用'))
+check('D100', cardTextOf('beta').includes('仅 /命令 可用'), `只关模型的 beta 那一行文案 = ${JSON.stringify(cardTextOf('beta'))}，应为「仅 /命令 可用」`)
+check('D101', cardTextOf('delta').includes('模型与 /命令 都不可用'), `两个键都关的 delta 那一行文案 = ${JSON.stringify(cardTextOf('delta'))}，应为「模型与 /命令 都不可用」`)
+// 开着的那一行**什么都不说**：两个文案一个都不许出现（两支都查，别只查一支）。
+check(
+  'D102',
+  !cardTextOf('alpha').includes('仅 /命令 可用') && !cardTextOf('alpha').includes('模型与 /命令 都不可用'),
+  `模型调用开着的那一行不该带调用提示，文案 = ${JSON.stringify(cardTextOf('alpha'))}`,
+)
+check('D103', !hintRender.text.includes('仅用户可调用'), `旧文案「仅用户可调用」不该再出现（对两个键都关的 skill 是假话），文本片段 = ${JSON.stringify(hintRender.text.slice(0, 320))}`)
+// 每个"模型关着"的行**恰好一个**提示徽标：三条 skill 里只有两条该有。
+check('D104', hintBadges.length === 2, `调用提示徽标出现 ${hintBadges.length} 次（${JSON.stringify(hintBadges)}），期望 2 次（beta 与 delta 各一次）`)
 
 // ─────────────────────────────────────────────────────────────────────────────
 

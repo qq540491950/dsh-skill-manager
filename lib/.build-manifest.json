@@ -12,9 +12,9 @@
     },
     {
       "output": "lib/client.js",
-      "outputSha256": "a0359fe0b8508a8e6228e706480ffff8ab7d7772a24f70d979f2858a636b9ebb",
+      "outputSha256": "ff5358f1f00fdbc1b86df9cbb9626d47833a0d4badb6bd9ecab8b9f12392a42e",
       "inputs": {
-        "src/client/index.ts": "5daee65d4d8502e6d478b2ea8c26efe804ac014dee24064db7ce8b1ae6963b47",
+        "src/client/index.ts": "3246034f36876ae7755ba1e7b713d9df322b330554e779690c85b2392105dce6",
         "src/client/service-types.ts": "f293e573591fa42ab102c0b5478890beb2113babf05ee390c3132c55b38272ed",
         "src/shared/types.ts": "56872ceac187913cdb8d1d5836789c9b061dcd1aac4663d8e2e261bed13c0273"
       }

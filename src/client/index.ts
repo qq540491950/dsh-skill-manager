@@ -373,6 +373,26 @@ function badge(text: string): ReactNode {
   return h('span', { className: 'dskm-badge', key: text }, text)
 }
 
+/**
+ * 这一行为什么不给模型自动调用——**照实说**，不把两种情形塞进一句话。
+ *
+ * 官方那两个 frontmatter 键本来就是两条独立通道：
+ *
+ * | 键 | 关掉之后 |
+ * |---|---|
+ * | `disable-model-invocation: true` | 模型看不到它（不在模型目录，`skill` 工具也调不到） |
+ * | `user-invocable: false` | 人手输入的 `/名字` 也看不到它 |
+ *
+ * 所以"模型关着"有两副面孔：作者只想让**人**用（`仅 /命令 可用`），或者两条都不给
+ * （`模型与 /命令 都不可用`——本机 `~/.dsh/skills/ask-matt` 就是这一种，两个键都写了）。
+ * 一律写成「仅用户可调用」对后一种是**假话**：把"你能 `/` 调它"说成事实，比不说话更糟。
+ * @returns 徽标文案；开着模型调用时返回 undefined（那就什么也不用说）。
+ */
+function modelHint(skill: SkillRow): string | undefined {
+  if (skill.modelInvocable !== false) return undefined
+  return skill.userInvocable === false ? '模型与 /命令 都不可用' : '仅 /命令 可用'
+}
+
 interface SkillCardProps {
   skill: SkillRow
   open: OpenState
@@ -385,6 +405,7 @@ interface SkillCardProps {
  */
 function SkillCard({ skill, open, onToggle }: SkillCardProps): ReactNode {
   const expanded = open.name === skill.name && open.phase !== 'idle'
+  const hint = modelHint(skill)
   return h(
     'li',
     { className: 'dskm-card' },
@@ -405,7 +426,7 @@ function SkillCard({ skill, open, onToggle }: SkillCardProps): ReactNode {
         'div',
         { className: 'dskm-badges' },
         badge(skill.provider ?? skill.source),
-        skill.modelInvocable === false ? badge('仅用户可调用') : null,
+        hint === undefined ? null : badge(hint),
         h(
           'button',
           {
