@@ -74,58 +74,19 @@ export interface SkillRegistry {
   ): Promise<SkillDetail | undefined>
 }
 
-/**
- * `ctx.fs`：只用 resolve / listDir / readText / stat / lstat / writeText 六个成员。
- *
- * `writeText` 是本插件**唯一**的写入出口（只用来改 `SKILL.md` 的 frontmatter）；
- * `stat` 的 `version` 是写入护栏（`replaceIfVersion`）的凭证，拿不到版本就不写。
- */
+/** `ctx.fs`：只用 resolve / listDir / readText / stat / lstat 五个成员。 */
 export interface FsEntry {
   name?: unknown
   type?: unknown
   target?: { displayPath?: unknown } | undefined
 }
 
-/**
- * 写入意图。
- *
- * 两种都**带护栏**，绝不无护栏覆盖：
- *  - `replaceIfVersion`：改一个已存在的文件（`SKILL.md`、已存在的账本），版本对不上就拒写；
- *  - `createIfAbsent`：只创建不覆盖（账本第一次落地时用；文件已存在时后端会拒）。
- */
-export type FsWriteIntent = { kind: 'replaceIfVersion'; version: string } | { kind: 'createIfAbsent' }
-
-/**
- * 一次写入的沙箱策略。
- *
- * `ctx.fs` 的 `writeText` 收它作为**第 5 个参数**；省略时后端走 agentless 兜底
- * （= 部署默认模式），而部署默认是 `workspace-write` → 工作区之外的 `~/.dsh/skills`
- * 一律被拒（实测原文：`file access denied under workspace-write mode`）。
- */
-export interface SandboxExecutionPolicy {
-  mode: 'read-only' | 'workspace-write' | 'danger-full-access'
-  workspaceRoot: string
-  sessionId?: string
-}
-
-/** `ctx.sandboxPolicy`：只用 `resolve()`（拿部署默认的模式与兜底 workspaceRoot）。 */
-export interface SandboxPolicyService {
-  resolve?(request?: { mode?: SandboxExecutionPolicy['mode'] }): SandboxExecutionPolicy | undefined
-}
-
 export interface FsService {
   resolve(path: string, options?: { signal?: AbortSignal }): Promise<string>
   listDir(target: string, signal?: AbortSignal): Promise<readonly FsEntry[] | undefined>
   readText(target: string, signal?: AbortSignal): Promise<unknown>
-  stat?(target: string, signal?: AbortSignal): Promise<{ type?: unknown; version?: unknown } | undefined>
+  stat?(target: string, signal?: AbortSignal): Promise<{ type?: unknown } | undefined>
   lstat?(path: string): Promise<unknown>
-  writeText?(
-    target: string,
-    content: string,
-    expected?: FsWriteIntent,
-    signal?: AbortSignal,
-    sandboxPolicy?: SandboxExecutionPolicy,
-  ): Promise<unknown>
 }
 
 /** `ctx.sessionQuery`：`observeSession()` 返回 **caller-owned** 租约，读完必须释放。 */

@@ -17,37 +17,6 @@ export type GroupKey = 'project' | 'global' | 'custom' | 'bundled' | 'other';
  */
 export type SkillSource = 'project-dsh' | 'project-agents' | 'user-dsh' | 'user-agents' | 'custom' | 'bundled' | 'runtime' | 'unknown';
 /**
- * 两个**正交**的调用轴。
- *
- * 官方 frontmatter 本来就是两个键、两条独立通道（`dsh-skill-filesystem` README
- * 「Skill format」）：`disable-model-invocation` 只挡模型目录与 `skill` 工具，
- * `user-invocable` 只挡人手输入的 `/名字`。把它们压成一个总开关会同时丢掉两件事：
- * 作者到底声明了什么、以及是**谁**关的这一轴。
- */
-export type InvocationAxis = 'model' | 'user';
-/**
- * 某一轴「关着」时是谁关的（只在该轴关着时有意义）。
- *
- * - `user`    本插件（本机）把这个轴关过，且文件当前仍是关 → 界面上「你停用的」
- * - `author`  文件自己写着停用，本插件没记录过 → 「作者已停用」
- * - `unknown` 账本读不出来（fs 缺能力 / 被拒 / 解析失败）→ 「来源未知」
- * - `none`    该轴是**开着**的，没有"谁关的"可谈
- *
- * **「未判定」绝不等于「作者停用」**：账本读不出来时只能报 `unknown`
- * （延续 AGENTS 3.8「未判定 ≠ 不存在」的同一条纪律）。
- */
-export type InvocationOrigin = 'author' | 'user' | 'unknown' | 'none';
-/** 两条轴各自的来源判定。 */
-export interface InvocationOrigins {
-    model: InvocationOrigin;
-    user: InvocationOrigin;
-}
-/** 两条轴各自能不能「还原」（账本里存着被删掉的原行、且该轴当前是开的）。 */
-export interface InvocationRestorable {
-    model: boolean;
-    user: boolean;
-}
-/**
  * 列表里的一行。
  *
  * 可选字段一律写成 `?: T | undefined`（不是 `?: T`）：`exactOptionalPropertyTypes` 下
@@ -66,23 +35,6 @@ export interface SkillRow {
     provider?: string | undefined;
     modelInvocable: boolean;
     userInvocable: boolean;
-    /**
-     * 每一轴**关着时是谁关的**（开着时是 `'none'`）。
-     *
-     * 这是**附加事实**，不是开关状态：状态仍是 `modelInvocable` / `userInvocable`。
-     * 真相永远是文件，账本只影响这一栏的标注与「还原」按钮是否可用。
-     */
-    origins: InvocationOrigins;
-    /** 账本里存着被删掉的原行 → 该轴可以「还原」回作者的声明。 */
-    restorable: InvocationRestorable;
-    /**
-     * 这一行的开关**能不能点**。
-     *
-     * 只有「项目 / 全局」四个规范根里的 skill 可写（宿主算得出路径、也写得进去）。
-     * `custom`（位置由 Config 决定）、`bundled` / `runtime`（随包或运行时注册）都不可写——
-     * 开关必须置灰，**点了没反应比没有开关更糟**。
-     */
-    writable: boolean;
     resourceKind?: string | undefined;
 }
 /**
@@ -128,29 +80,6 @@ export interface SkillBody {
     content: string;
     truncated: boolean;
     contentLength: number;
-}
-/**
- * POST `op: "set-invocation"` / `op: "restore-invocation"` 的 `data`。
- *
- * 两条 op 共用这个形状：`restore-invocation` 额外带 `restored: true`。
- * `changed: false` 表示"它本来就是那个状态"——宿主**没有写文件**（也没有动账本），
- * 客户端据此不要做任何本地变更。
- *
- * `origins` / `restorable` 只报**这一轴**的新值：客户端只 patch 那一格，
- * 不需要（也不该）为了一次点击去重读整页。
- */
-export interface InvocationResult {
-    name: string;
-    path?: string | undefined;
-    axis: InvocationAxis;
-    /** 写完（或还原完）之后该轴**是否开着**。 */
-    enabled: boolean;
-    /** 只有 `set-invocation` 给：这次是否真的改了（false = 幂等，没写文件）。 */
-    changed?: boolean | undefined;
-    /** 只有 `restore-invocation` 给：确实是还原路径。 */
-    restored?: boolean | undefined;
-    origins: InvocationOrigins;
-    restorable: InvocationRestorable;
 }
 /** 路由响应包络：成功带 `data`，失败**没有** `data`（自检 5.5 钉这条）。 */
 export type ApiResponse<TData> = {

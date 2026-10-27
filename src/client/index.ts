@@ -13,31 +13,9 @@
  *
  * ## 本插件做什么
  *
- * 往 `settings.section`（**list 座位**）注册一页「Skills」，按来源分组
- * （项目 / 全局 / 自定义 / 随包内置）浏览已发现的 skill。
- * `order: 910` 让它落在设置列表里 MCP 页（`dsh-mcp-manager`，`order: 900`）之后。
- *
- * ## 每行两个**正交**的开关，外加"是谁关的"与「还原」
- *
- * 官方的两个键本来就是两条独立通道（`dsh-skill-filesystem` README「Skill format」）：
- *
- * | 界面开关 | frontmatter 键 | 关掉之后 |
- * |---|---|---|
- * | `模型` | `disable-model-invocation: true` | 模型目录与 `skill` 工具看不到它 |
- * | `/命令` | `user-invocable: false` | 人手输入的 `/名字` 看不到它 |
- *
- * **各点各的**：关 `模型` 不动 `/命令` 那一行，反之亦然（旧的"一个总开关"会把两个键
- * 一起写/一起删，既把只关了一个轴的 skill 显示成"整体关"，又会在打开时抹平作者的声明）。
- *
- * 关着的轴旁边还有一个**来源 chip**，回答"是谁关的"（宿主按账本 + 文件判定）：
- * `你停用的` / `作者已停用` / `来源未知`（账本读不出来时如实这么说，**不猜**成作者停用）。
- * 如果账本里存着我们打开它时删掉的原始行，该轴旁再给一个「还原」小按钮——
- * 点它把原行原样写回、清掉该轴记录，等于回到"作者的声明"。
- *
- * 这两个开关是这一页**唯一**的写操作，且刻意做成最朴素的形态：点一下 → 一次 POST →
- * 只改这一行的这一格本地状态，**不整页刷新**（刷新会把列表打回「读取中…」、把展开的
- * 正文收掉）。它**没有**删除功能：`ctx.fs` 的契约里没有 unlink/rmdir，真删只能起
- * shell 进程，那会绕过沙箱围栏（见 AGENTS 8）。
+ * 往 `settings.section`（**list 座位**）注册一页「Skills」，只读展示已发现的 skill，
+ * 按来源分组（项目 / 全局 / 自定义 / 随包内置）。`order: 910` 让它落在设置列表里
+ * MCP 页（`dsh-mcp-manager`，`order: 900`）之后。
  *
  * ## 为什么设置页拿得到「当前 session」
  *
@@ -87,17 +65,7 @@
 
 import { createElement, useCallback, useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
-import type {
-  ApiResponse,
-  CatalogPayload,
-  GroupKey,
-  InvocationAxis,
-  InvocationOrigin,
-  InvocationResult,
-  RootRow,
-  SkillBody,
-  SkillRow,
-} from '../shared/types.ts'
+import type { ApiResponse, CatalogPayload, GroupKey, RootRow, SkillBody, SkillRow } from '../shared/types.ts'
 import type { ClientContext } from './service-types.ts'
 
 /** `JSX` 的运行时长啥样：`h(...)` 就是 `react.createElement`（classic 风格，不碰 jsx-runtime）。 */
@@ -329,23 +297,6 @@ const CSS = `
 .dskm-desc { font-size:12px; line-height:16px; color:var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary)); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .dskm-badges { display:flex; align-items:center; flex:none; gap:4px; }
 .dskm-badge { flex:none; display:inline-flex; align-items:center; height:18px; padding:0 6px; border-radius:var(--dsw-radius-sm, 4px); background:var(--dsw-alias-bg-module-platform, var(--dsw-alias-bg-layer-1)); color:var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary)); font-size:11px; line-height:18px; white-space:nowrap; }
-.dskm-switch { box-sizing:border-box; flex:none; position:relative; width:32px; height:18px; padding:0; border:.5px solid var(--dsw-alias-border-l4, var(--dsw-alias-border-l3)); border-radius:9px; background:var(--dsw-alias-bg-layer-2, var(--dsw-alias-bg-layer-1)); cursor:pointer; transition:background .12s ease, border-color .12s ease; }
-.dskm-switch:hover:not(:disabled) { border-color:var(--dsw-alias-border-l3, currentColor); }
-.dskm-switch:focus-visible { outline:var(--dsw-focus-ring-width, 2px) solid var(--dsw-focus-ring-color, var(--dsw-alias-brand-primary)); outline-offset:1px; }
-.dskm-switch:disabled { opacity:.4; cursor:not-allowed; }
-.dskm-switch--on { border-color:transparent; background:var(--dsw-alias-state-business-primary, var(--dsw-alias-brand-primary)); }
-.dskm-knob { position:absolute; top:2px; left:2px; width:12px; height:12px; border-radius:50%; background:var(--dsw-alias-bg-base); transition:transform .12s ease; }
-.dskm-switch--on .dskm-knob { transform:translateX(14px); }
-/* 一条轴：轴名 + 开关 + 来源 chip + 「还原」。两条轴各占一组，互不影响。 */
-.dskm-axis { box-sizing:border-box; display:flex; align-items:center; flex:none; gap:4px; }
-.dskm-axisLabel { flex:none; color:var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary)); font-size:11px; line-height:18px; white-space:nowrap; }
-/* 来源 chip：只在**关着**的轴旁边出现，说清是谁关的。 */
-.dskm-chip { flex:none; display:inline-flex; align-items:center; height:18px; padding:0 6px; border-radius:var(--dsw-radius-sm, 4px); background:var(--dsw-alias-bg-module-platform, var(--dsw-alias-bg-layer-1)); color:var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary)); font-size:11px; line-height:18px; white-space:nowrap; }
-/* 「还原」文字按钮：把账本里备份的原始行写回去。 */
-.dskm-link { box-sizing:border-box; flex:none; display:inline-flex; align-items:center; height:18px; padding:0 4px; border:none; border-radius:var(--dsw-radius-sm, 4px); background:transparent; color:var(--dsw-alias-state-business-primary, var(--dsw-alias-brand-primary)); font:inherit; font-size:11px; line-height:18px; cursor:pointer; text-decoration:underline; }
-.dskm-link:hover { background:var(--dsw-alias-interactive-bg-hover); }
-.dskm-link:focus-visible { outline:var(--dsw-focus-ring-width, 2px) solid var(--dsw-focus-ring-color, var(--dsw-alias-brand-primary)); outline-offset:1px; }
-.dskm-link:disabled { opacity:.4; cursor:not-allowed; }
 .dskm-detail { box-sizing:border-box; min-width:0; display:flex; flex-direction:column; gap:6px; margin-top:8px; padding:10px 12px; border-radius:var(--dsw-radius-lg, 8px); background:var(--dsw-alias-bg-module-platform, var(--dsw-alias-bg-layer-1)); }
 .dskm-path { font-size:11px; line-height:16px; color:var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary)); overflow-wrap:anywhere; }
 .dskm-pre { margin:0; max-height:320px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; font-family:ui-monospace, monospace; font-size:11px; line-height:16px; color:var(--dsw-alias-label-secondary); }
@@ -422,171 +373,17 @@ function badge(text: string): ReactNode {
   return h('span', { className: 'dskm-badge', key: text }, text)
 }
 
-/**
- * 开关**一条轴**（宿主改写它 `SKILL.md` frontmatter 的对应那一行）。
- *
- * 只发**名字 + 轴 + 目标状态**：文件路径由宿主自己算（客户端给路径 = 越权）。
- * 同样带 `sessionId`/`cwd`，保证"我关的是我看到的那个作用的那个文件"。
- */
-async function setInvocation(
-  sessionId: string | undefined,
-  name: string,
-  axis: InvocationAxis,
-  enabled: boolean,
-  cwd: string | null,
-): Promise<InvocationResult> {
-  const response = await fetch(
-    ROUTE,
-    requestInit({
-      method: 'POST',
-      headers: { accept: 'application/json', 'content-type': 'application/json' },
-      body: JSON.stringify({ op: 'set-invocation', name, axis, enabled, sessionId, cwd: normalizeCwd(cwd) }),
-    }),
-  )
-  const body = (await response.json().catch(() => null)) as ApiResponse<InvocationResult> | null
-  if (body === null || body.ok !== true) {
-    throw new Error((body === null || body.ok !== false ? undefined : body.error) ?? `宿主返回 HTTP ${response.status}`)
-  }
-  return body.data
-}
-
-/** 还原**一条轴**：宿主把账本里备份的原始行原样写回（等于回到"作者的声明"）。 */
-async function restoreInvocation(
-  sessionId: string | undefined,
-  name: string,
-  axis: InvocationAxis,
-  cwd: string | null,
-): Promise<InvocationResult> {
-  const response = await fetch(
-    ROUTE,
-    requestInit({
-      method: 'POST',
-      headers: { accept: 'application/json', 'content-type': 'application/json' },
-      body: JSON.stringify({ op: 'restore-invocation', name, axis, sessionId, cwd: normalizeCwd(cwd) }),
-    }),
-  )
-  const body = (await response.json().catch(() => null)) as ApiResponse<InvocationResult> | null
-  if (body === null || body.ok !== true) {
-    throw new Error((body === null || body.ok !== false ? undefined : body.error) ?? `宿主返回 HTTP ${response.status}`)
-  }
-  return body.data
-}
-
-/**
- * 这一行的开关为什么点不了——**照实说**，不甩一句"不可用"。
- *
- * 三种来源三种原因：随包/运行时没有文件、配置目录定位不到、其余未知。
- * 两个开关（模型 / 命令）共用同一个原因：它们写的是同一份文件。
- */
-function notWritableHint(skill: SkillRow): string {
-  if (skill.source === 'bundled' || skill.source === 'runtime') return '随包内置的 skill 没有可改写的文件，开关不可用'
-  if (skill.source === 'custom') return '这个 skill 在 Config.customSkillDirs 指定的目录里，本页定位不到它的文件'
-  return '这个 skill 没有可改写的文件，开关不可用'
-}
-
-/** 两条轴的界面文案。`axis` 是**唯一**的分支依据：开关、chip、还原都按它取值。 */
-const AXIS_TEXT: Record<InvocationAxis, { label: string; aria: string }> = {
-  model: { label: '模型', aria: '模型调用' },
-  user: { label: '/命令', aria: '斜杠命令' },
-}
-
-/** 「谁关的」三句话。`none` 不在这里——开着的轴**不渲染** chip。 */
-const ORIGIN_TEXT: Record<Exclude<InvocationOrigin, 'none'>, string> = {
-  user: '你停用的',
-  author: '作者已停用',
-  unknown: '来源未知',
-}
-
-/** 这一轴当前是开还是关。**只读同一条轴**，别拿另一条轴的字段凑。 */
-function axisEnabled(skill: SkillRow, axis: InvocationAxis): boolean {
-  return axis === 'model' ? skill.modelInvocable !== false : skill.userInvocable !== false
-}
-
-/** 这一轴"关着时是谁关的"（宿主算好的事实；缺字段时按"开"处理，不编来源）。 */
-function axisOrigin(skill: SkillRow, axis: InvocationAxis): InvocationOrigin {
-  const origins = skill.origins
-  const value = origins === undefined || origins === null ? undefined : origins[axis]
-  return value === 'author' || value === 'user' || value === 'unknown' ? value : 'none'
-}
-
-/** 这一轴能不能「还原」（账本里存着我们打开它时删掉的原行）。 */
-function axisRestorable(skill: SkillRow, axis: InvocationAxis): boolean {
-  const restorable = skill.restorable
-  return restorable !== undefined && restorable !== null && restorable[axis] === true
-}
-
 interface SkillCardProps {
   skill: SkillRow
   open: OpenState
   onToggle: (skill: SkillRow) => Promise<void>
-  onFlip: (skill: SkillRow, axis: InvocationAxis) => Promise<void>
-  onRestore: (skill: SkillRow, axis: InvocationAxis) => Promise<void>
-  busy: readonly string[]
-}
-
-/**
- * 一条轴的那一组控件：轴名 + 开关 +（关着时）来源 chip +（有备份时）「还原」。
- *
- * 做成**普通函数**而不是组件：它不持有状态、不调 hook，单独抽出来只为让
- * 「模型」「/命令」两组控件长得一模一样——两组各点各的，互不影响。
- */
-function axisControl(
-  skill: SkillRow,
-  axis: InvocationAxis,
-  args: { onFlip: SkillCardProps['onFlip']; onRestore: SkillCardProps['onRestore']; busy: readonly string[] },
-): ReactNode {
-  const on = axisEnabled(skill, axis)
-  const origin = axisOrigin(skill, axis)
-  const writable = skill.writable === true
-  const pending = args.busy.includes(skill.name)
-  const text = AXIS_TEXT[axis]
-  const hint = writable ? `${on ? '关闭' : '打开'}「${skill.name}」的${text.aria}` : notWritableHint(skill)
-  return h(
-    'div',
-    { className: 'dskm-axis', key: axis },
-    h('span', { className: 'dskm-axisLabel' }, text.label),
-    h(
-      'button',
-      {
-        type: 'button',
-        role: 'switch',
-        className: on ? 'dskm-switch dskm-switch--on' : 'dskm-switch',
-        'aria-checked': on ? 'true' : 'false',
-        'aria-label': `${skill.name}：${text.aria}`,
-        title: hint,
-        disabled: !writable || pending,
-        onClick: () => args.onFlip(skill, axis),
-      },
-      h('span', { className: 'dskm-knob' }),
-    ),
-    // chip **只在关着的时候**渲染：开着就没有"谁关的"可谈（也避免两行字重叠）。
-    on || origin === 'none' ? null : h('span', { className: 'dskm-chip', key: 'chip' }, ORIGIN_TEXT[origin]),
-    axisRestorable(skill, axis)
-      ? h(
-          'button',
-          {
-            type: 'button',
-            className: 'dskm-link',
-            key: 'restore',
-            title: `把${text.label}那一行恢复成作者的原始声明`,
-            disabled: pending,
-            onClick: () => args.onRestore(skill, axis),
-          },
-          '还原',
-        )
-      : null,
-  )
 }
 
 /**
  * 一条 skill。点击展开正文——正文按需拉取，不跟着列表一起下来
  * （一个 skill 的 `SKILL.md` 可能几十 KB，全量预取会把列表拖垮）。
- *
- * 行尾是**两个**开关（`模型` / `/命令`），对应官方 frontmatter 的两个正交键：
- * 关 `模型` 只写 `disable-model-invocation: true`，关 `/命令` 只写 `user-invocable: false`。
- * 不可写的来源（随包内置 / 配置目录 / 运行时）两个都禁用，并用 `title` 说明原因。
  */
-function SkillCard({ skill, open, onToggle, onFlip, onRestore, busy }: SkillCardProps): ReactNode {
+function SkillCard({ skill, open, onToggle }: SkillCardProps): ReactNode {
   const expanded = open.name === skill.name && open.phase !== 'idle'
   return h(
     'li',
@@ -608,6 +405,7 @@ function SkillCard({ skill, open, onToggle, onFlip, onRestore, busy }: SkillCard
         'div',
         { className: 'dskm-badges' },
         badge(skill.provider ?? skill.source),
+        skill.modelInvocable === false ? badge('仅用户可调用') : null,
         h(
           'button',
           {
@@ -618,8 +416,6 @@ function SkillCard({ skill, open, onToggle, onFlip, onRestore, busy }: SkillCard
           },
           expanded ? '收起' : '查看',
         ),
-        axisControl(skill, 'model', { onFlip, onRestore, busy }),
-        axisControl(skill, 'user', { onFlip, onRestore, busy }),
       ),
     ),
     expanded ? h(SkillDetail, { open, skill }) : null,
@@ -691,19 +487,12 @@ function SkillSection(props: SkillSectionProps): ReactNode {
   const [picked, setPicked] = useState<string | null>(null)
   // `null` = 看当前会话（宿主自己取权威 cwd）。选了别的项目才显式传 cwd。
   const [pickedCwd, setPickedCwd] = useState<string | null>(null)
-  // 正在写的那些 skill 名（开关按钮在飞行中要禁用，避免连点两次写出两个状态）。
-  const [busy, setBusy] = useState<readonly string[]>([])
-  // 开关动作失败的原因。**独立于页面相位**：目录是好的，只是这一下没写成，
-  // 不该因此把整个列表打回"读取中"。同一时刻只会有一条（AGENTS 3.7）。
-  const [notice, setNotice] = useState<string | null>(null)
 
   useEffect(() => {
     let alive = true
     setState({ phase: 'loading' })
     // 切换 session/项目时把展开态收掉：正文属于上一个视图，留着会串。
     setOpen({ name: null, phase: 'idle' })
-    // 上一次开关的失败原因属于上一个视图，一并清掉（不留一条过期错误）。
-    setNotice(null)
     fetchCatalog(sessionId, pickedCwd)
       .then((data) => {
         if (alive) setState({ phase: 'ready', data })
@@ -740,81 +529,6 @@ function SkillSection(props: SkillSectionProps): ReactNode {
     [sessionId, pickedCwd, open.name, open.phase],
   )
 
-  /**
-   * 把一次写操作的结果并回**这一行**——而且只并**被点的那条轴**。
-   *
-   * 这里不许整页刷新（`nonce` 那条路只留给「刷新」按钮），也不许把两条轴写成同一个值
-   * （那是旧总开关的语义）。来源/还原也一起更新，否则 chip 与「还原」要等下次刷新才变。
-   */
-  const patchAxisRow = useCallback((name: string, axis: InvocationAxis, result: InvocationResult): void => {
-    setState((previous) => {
-      if (previous.phase !== 'ready' || previous.data === undefined) return previous
-      return {
-        phase: 'ready',
-        data: {
-          ...previous.data,
-          skills: previous.data.skills.map((row) => {
-            if (row.name !== name) return row
-            const on = result.enabled
-            const origins = { ...(row.origins ?? { model: 'none', user: 'none' }) }
-            const restorable = { ...(row.restorable ?? { model: false, user: false }) }
-            origins[axis] = result.origins?.[axis] ?? (on ? 'none' : 'unknown')
-            restorable[axis] = result.restorable?.[axis] === true
-            return {
-              ...row,
-              modelInvocable: axis === 'model' ? on : row.modelInvocable,
-              userInvocable: axis === 'user' ? on : row.userInvocable,
-              origins,
-              restorable,
-            }
-          }),
-        },
-      }
-    })
-  }, [])
-
-  /**
-   * 开关**一条轴**：发 POST → 成功后**只改这一行的这一格**本地状态。
-   *
-   * 刻意不整页刷新：刷新会把列表打回「读取中…」再回来，用户点一下开关结果整页闪一次，
-   * 而且正在展开的正文也会被收掉。宿主那边的 watcher 已经会让模型目录自更新，
-   * 这里只要显示跟上即可。**只 patch 被点的那条轴的字段**——把两条轴写成同一个值
-   * 正是这一轮要修掉的老毛病。
-   */
-  const onFlip = useCallback(
-    (skill: SkillRow, axis: InvocationAxis): Promise<void> => {
-      const next = !axisEnabled(skill, axis)
-      setBusy((previous) => (previous.includes(skill.name) ? previous : [...previous, skill.name]))
-      setNotice(null)
-      return setInvocation(sessionId, skill.name, axis, next, pickedCwd)
-        .then((result) => patchAxisRow(skill.name, axis, result))
-        .catch((error: unknown) => setNotice(describeError(error)))
-        .then(() => {
-          setBusy((previous) => previous.filter((name) => name !== skill.name))
-        })
-    },
-    [sessionId, pickedCwd, patchAxisRow],
-  )
-
-  /**
-   * 还原**一条轴**：把账本里备份的原始行写回去（回到"作者的声明"）。
-   *
-   * 和开关走同一套本地更新：只改这一行的这一格，失败同样只用一句 `notice`。
-   */
-  const onRestore = useCallback(
-    (skill: SkillRow, axis: InvocationAxis): Promise<void> => {
-      setBusy((previous) => (previous.includes(skill.name) ? previous : [...previous, skill.name]))
-      setNotice(null)
-      return restoreInvocation(sessionId, skill.name, axis, pickedCwd)
-        .then((result) => patchAxisRow(skill.name, axis, result))
-        .catch((error: unknown) => setNotice(describeError(error)))
-        .then(() => {
-          setBusy((previous) => previous.filter((name) => name !== skill.name))
-        })
-    },
-    [sessionId, pickedCwd, patchAxisRow],
-  )
-
   const data = state.phase === 'ready' ? state.data : undefined
   const tabs = data === undefined ? [] : buildTabs(data.skills, data.roots)
   // 选中的标签页：用户点过就用他点的；否则**默认落在第一个非空的那一格**，
@@ -838,9 +552,6 @@ function SkillSection(props: SkillSectionProps): ReactNode {
     // 页面级读取失败是**唯一**允许出现的提示：用户需要知道，且能点「刷新」重试。
     // 提供方原文、作用域/cwd/提供方/完整性这些诊断**一律不再渲染**（用户要求）。
     state.phase === 'failed' ? h('div', { className: 'dskm-notice dskm-notice--error' }, state.error) : null,
-
-    // 开关动作失败：目录本身是好的，所以它**只**说这一下为什么没写成，不动列表。
-    notice === null ? null : h('div', { className: 'dskm-notice dskm-notice--error' }, notice),
 
     h(
       'div',
@@ -931,7 +642,7 @@ function SkillSection(props: SkillSectionProps): ReactNode {
             : h(
                 'ul',
                 { className: 'dskm-rows' },
-                tab.items.map((skill) => h(SkillCard, { key: skill.name, skill, open, onToggle, onFlip, onRestore, busy })),
+                tab.items.map((skill) => h(SkillCard, { key: skill.name, skill, open, onToggle })),
               ),
         ),
   )

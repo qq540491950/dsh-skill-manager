@@ -1,15 +1,11 @@
 # dsh-skill-manager
 
-DSH Web 客户端插件：在**设置面板**里加一页「Skills」，按来源分组
-（项目 / 全局 / 自定义 / 随包内置）浏览当前会话可见的 skill，并给每一行一个
-**启用 / 关闭**开关。
+DSH Web 客户端插件：在**设置面板**里加一页「Skills」，**只读**浏览当前会话可见的 skill，
+按来源分组（项目 / 全局 / 自定义 / 随包内置）。
 
-**写入面只有一个**（2026-10-27 从"纯只读"扩出来的）：开关改写那份 `SKILL.md` 的
-frontmatter —— 关 = 写 `disable-model-invocation: true` + `user-invocable: false`，
-开 = 删掉这两个键。写入一律带 `replaceIfVersion` 版本护栏，目标文件由宿主自己按规范根
-算出来（客户端只能给名字）。仍然没有 `ctx.configEditor.edit()`、不碰
-`~/.dsh/profiles/**`、不碰 `ctx.loader.*`，**也没有删除**（`ctx.fs` 没有 unlink/rmdir，
-真删只能起 shell 进程并绕过沙箱围栏）。`tools/verify.ts` 的 A11–A15 / A34–A36 钉这条纪律。
+**第一阶段范围**：只做查看。没有任何创建、编辑、删除、启停路径——没有
+`ctx.configEditor.edit()`，不碰 `~/.dsh/profiles/**`，不碰 `ctx.loader.*`。
+`tools/verify.ts` 的 A11–A15 就是钉这条纪律的。
 
 ```powershell
 npm run check              # typecheck + build + verify（交付前跑这条）
@@ -24,7 +20,7 @@ node tools/verify.ts       # 只跑自检；零依赖，不装 node_modules 也�
 
 | 半边 | 源码 | 产物 | 职责 |
 |---|---|---|---|
-| 宿主 | `src/host/index.ts`（+ `service-types.ts`） | `lib/index.js`（ESM 单文件） | **产物零 import**。用 `ctx.connection.fetch.register()` 开一条路由 `/api/skill-manager`（GET 纯读 + 两个 POST：`read` / `set-enabled`），内部解析作用域后读 `ctx.skills`，**并只读直读四个规范根目录**（§3.3）。写入面只有一处：改 `SKILL.md` 的 frontmatter（§5.1）。 |
+| 宿主 | `src/host/index.ts`（+ `service-types.ts`） | `lib/index.js`（ESM 单文件） | **产物零 import**。用 `ctx.connection.fetch.register()` 开一条只读路由 `/api/skill-manager`，内部解析作用域后读 `ctx.skills`，**并只读直读四个规范根目录**（§3.3）。 |
 | 客户端 | `src/client/index.ts`（+ `service-types.ts`） | `lib/client.js`（懒 CJS 工厂） | `window.__ModuleLoader__` 懒 CJS bundle（包装与 `id` 由构建脚本注入）。往 `settings.section`（list 座位，`order: 910`）注册一页，同源 `fetch` 取数并渲染。 |
 | 共用 | `src/shared/types.ts` | 无（只有类型，被擦除） | 两半边共用的 payload 契约。 |
 
@@ -217,13 +213,6 @@ skill 也一起消失**——页面上表现为「选了项目还是只有随包
       "provider": "filesystem",
       "modelInvocable": true,
       "userInvocable": true,
-      // 两个开关**能不能点**：只有四个规范根（项目 ×2 + 用户 ×2）里的 skill 为 true。
-      // custom 由 Config 决定位置、bundled/runtime 没有文件 → false（界面置灰并说明原因）。
-      "writable": true,
-      // 每一轴**关着时是谁关的**（开着时是 "none"）。逐轴独立，规则见 §5.1。
-      "origins": { "model": "author", "user": "none" },
-      // 账本里存着我打开它时删掉的原始行 → 该轴可以「还原」。
-      "restorable": { "model": false, "user": false },
       "resourceKind": "directory"    // 可选
     }],
     "counts": { "project": 0, "global": 0, "custom": 3, "bundled": 0, "other": 0 },
@@ -246,7 +235,7 @@ skill 也一起消失**——页面上表现为「选了项目还是只有随包
     "presetId": "cordis",           // 可选
     "cwd": "D:/project/…",          // 可选；无 sessionId 时为 undefined
     "route": "/api/skill-manager",
-    "capabilities": ["snapshot", "read", "set-invocation", "restore-invocation"]
+    "capabilities": ["snapshot", "read"]
   }
 }
 ```
@@ -268,88 +257,6 @@ skill 也一起消失**——页面上表现为「选了项目还是只有随包
 （B92–B96 钉这条。）
 
 失败一律 `4xx/5xx` + `{ ok: false, error }`，错误原文直接给用户看。未知 `op` → 400。
-
-### `POST { "op": "set-invocation", "name": "<skill>", "axis": "model" | "user", "enabled": <bool>, "sessionId": "<id>", "cwd": "<path>" }`
-
-**按轴**改写那份 `SKILL.md` 的 frontmatter。两个键是**两条正交的通道**（`dsh-skill-filesystem`
-README「Skill format」），所以本插件也让它们各读各写：
-
-| `axis` | 关（`enabled: false`）写什么 | 开（`enabled: true`）做什么 | 官方语义 |
-|---|---|---|---|
-| `model` | `disable-model-invocation: true` | 删掉**这一行** | 模型目录与 `skill` 工具看不到它 |
-| `user` | `user-invocable: false` | 删掉**这一行** | 人手输入的 `/名字` 看不到它 |
-
-返回 `{ name, path?, axis, enabled, changed, origins, restorable }`。
-`changed: false` = 这一轴本来就是那个状态，**宿主既没写文件、也没动账本**（幂等）。
-
-### `POST { "op": "restore-invocation", "name": "<skill>", "axis": "model" | "user", "sessionId": "<id>", "cwd": "<path>" }`
-
-把账本里备份的**原始行原文**写回 frontmatter，并**清掉该轴的账本记录**——
-等于回到「作者的声明」状态（`origins[axis]` 随之变成 `'author'` 或 `'none'`）。
-返回 `{ name, path?, axis, enabled, restored: true, origins, restorable }`。
-账本里没有该轴的备份时如实 409（**不猜**"原始声明应该是什么"）。
-
-### §5.1 写入纪律与来源标注
-
-纪律（A14 / A34–A36、B100–B161 钉住）：
-
-- **只改被点的那一行**，其余字节原样保留（`splitFrontmatter` 逐字节重建头部，正文不动）——
-  所以「关 → 开」能逐字节回到原文件（B109），而关 `模型` 不会顺手动 `/命令`（B104/B131）。
-- 写入面现在是**恰好两处**（A14）：`writeSkillFile` 改 `SKILL.md`、`writeStateFile` 改账本。
-  前者用 `{ kind: 'replaceIfVersion', version }`，后者不存在时 `{ kind: 'createIfAbsent' }`、
-  存在时 `replaceIfVersion`；两处都**显式带 `writePolicy()`**（B106/B121/B122/B138/B139/B140）。
-  拿不到版本号就**不写**。
-- 写入必须**显式带 per-call 沙箱策略**（`writeText` 第 5 个参数），mode 是 `danger-full-access`。
-  省略它时 `fs-sandbox` 走 agentless 兜底 = 部署默认（本机 `workspace-write`），
-  工作区之外的 `~/.dsh/skills` 一律被拒——实测原文：
-  `cannot write "C:\Users\admin\.dsh\skills\to-tickets\SKILL.md": file access denied under workspace-write mode`。
-  为什么不抄会话当前的 mode：这个开关是**设置动作**（用户在设置页点的），和模型在会话里改文件
-  不是一类事。`workspaceRoot` 仍取自 `ctx.sandboxPolicy.resolve()`。（B121/B122 钉这条。）
-- 用 `writeText` 整文件替换而**不用 `editText`**：文本匹配式编辑可能撞上重复的
-  `description` 片段。
-- **不接受客户端给的路径**：目标文件由宿主按规范根自己算（B114）。未知 `op` / 未知 `axis` /
-  缺 `enabled` 一律 400（B157–B159）。
-- 不可写的来源（`custom` / `bundled` / `runtime`）一律 409 + 说明原因，且**一个字节都不写**（B110–B113）。
-- 生效不需要重启：provider watch 着每个根，`SKILL.md` 一改就 invalidate，模型下一步拿到替换后的目录。
-
-**账本**（`$DSH_HOME/.skill-manager-state.json`，`DSH_HOME` 缺失时 `~/.dsh/.skill-manager-state.json`）
-是插件**自己的状态，不是真相来源**——文件才是真相。它只回答两件文件回答不了的事：
-
-```jsonc
-{ "version": 1,
-  "entries": {
-    // key = 宿主算出来的 SKILL.md 绝对路径
-    "C:/Users/admin/.dsh/skills/ask-matt/SKILL.md": {
-      // enabled:false = 我把这一轴关过；true = 我把这一轴开过
-      "model": { "enabled": false, "at": 1761000000000, "removed": [] },
-      // removed = 我把它打开时删掉的**原始行原文**（开着且作者本来就允许 → 空数组）
-      "user":  { "enabled": true,  "at": 1761000000000, "removed": ["user-invocable: false"] }
-    }
-  } }
-```
-
-**来源（provenance）规则，逐轴独立**：
-
-```
-该轴开着                                → origins[axis] = 'none'     （不渲染 chip）
-该轴关着 && 账本不可用                   → 'unknown'  → 界面「来源未知」
-该轴关着 && 账本[该轴].enabled === false → 'user'     → 界面「你停用的」
-该轴关着 && 其余（账本可用、无该轴记录）   → 'author'   → 界面「作者已停用」
-
-restorable[axis] = 账本可用 && 账本[该轴].removed.length > 0 && 该轴开着
-```
-
-- **「未判定」绝不等于「作者停用」**：账本读不出来（fs 缺 `writeText`/`stat` 能力、沙箱拒绝、
-  JSON 解析失败、版本号缺失）时一律报 `'unknown'`，**不猜**。（B154/B155 钉这条。）
-- 账本**不可用时功能照常可用**（开关还是照写文件），只是没有来源标注、没有「还原」；
-  这种情况下**也不写账本**——绝不拿一份空账本去覆盖别人的记录（B152/B153）。
-- 账本丢失/删掉只会让标注退化为 `'unknown'`，不影响任何"是否生效"的判断。
-- 还原写入的位置：接在现有 frontmatter 键行之后（我们只存行原文、不存行号），
-  多行时保持原来的相对顺序。
-
-**没有删除。** `ctx.fs` 的契约里没有 unlink/rmdir/rename，真删只能 `ctx.subprocess`
-起一条 shell —— 那会绕过沙箱围栏（围栏在工具层），且 Windows 上 `Remove-Item` 对
-junction 有递归删到目标目录的历史 bug。A35 就是钉"产物里不许出现删除/起进程的痕迹"。
 
 ---
 
@@ -483,15 +390,14 @@ lib  cordis.patch.yml  locale/*.json  assets/icon.svg  README.md  LICENSE
   `exports["./cordis.patch.yml"]`、`exports["./locale/*.json"]` 都还在
   （P 区在源码侧已钉过一遍，这里看的是**实际打出来的包**）。
 
-### 6.7 状态：bundle 已真装（v0.2.0），仍未 `npm publish`
+### 6.7 状态：未发布、已在 desktop profile 装过一次
 
 | 项 | 状态 |
 |---|---|
 | 包改造（字段 / patch 层 / locale / icon / LICENSE / CI） | 已完成；静态断言在 P 区 |
-| 真装进 profile | **已实测（2026-10-27）**：`install_bundle` 装 `github:qq540491950/dsh-skill-manager#v0.2.0` → `application: applied`、`warnings: []`，profile 里 `0.1.0 → 0.2.0`。当时用户是 v0.1.0（github 路线）在用，页面可见 |
-| 升级装进 profile（v0.3.0） | **已实测（2026-10-27）**：`install_bundle(target: 'github:qq540491950/dsh-skill-manager#v0.3.0')` → `application: applied`、`warnings: []`，profile 依赖 `0.2.1 → 0.3.0`（pnpm 输出 `+ 0.3.0`）。**装完的页面表现仍未实测**：宿主半边变了，要重启 DSH |
-| 装完之后的**页面表现** | **仍未实测**：`src/host/**` 变了，要重启 DSH 才生效（`application: applied` 只说明 Loader 认了这一次安装，不等于宿主半边已在跑新代码） |
-| `npm publish` | **未做**：本机 `npm whoami` → `ENEEDAUTH`（未登录）。安装走的是 git tag，不是注册表 |
+| 真装进 profile | **已实测**（2026-10-27）：`github:qq540491950/dsh-skill-manager#v0.2.0` → `application: applied`、`warnings: []`，profile 依赖 `0.1.0 → 0.2.0`；随后 `#v0.3.0` 同样 applied（`0.2.1 → 0.3.0`）。但**装完的页面表现未实测**（宿主半边要重启，见 §8） |
+| 当前源码版本（`0.4.0`，只读形态） | **未装、未重启**：profile 里跑的还是 `0.3.0`（带开关那一版）。要让它生效得按 §6.4 就地装 `#v0.4.0`，然后重启一次 DSH |
+| `npm publish` | **未做**：本机 `npm whoami` → `ENEEDAUTH`（未登录） |
 | 图标在界面里的观感 | **未见**：`icon` 只进 bundle 清单，座位注册不吃它 |
 
 所以 §7.2 的"未实测"清单照旧有效。**不要因为包里有了这些字段就写成"已发布"。**
@@ -520,14 +426,10 @@ lib  cordis.patch.yml  locale/*.json  assets/icon.svg  README.md  LICENSE
 | **项目根里确实有 skill**：`D:\project\agent-go\.agents\skills` 存在，含 8 个 `SKILL.md`（`edd-prototype`/`git-commit`/`git-push`/`handoff`/`personal-weekly-report`/`req`/`wails3-upgrade`/`weekly-report`） | 直接列目录（第二次实测期间） |
 | **本机确实没有项目/全局 skill（第一次实测时）**：`.dsh/skills`、`.agents/skills`（项目侧）与 `~/.dsh/skills` 都不存在，`~/.agents/skills` 存在但为空 | 直接列目录 |
 | **`dsh-skill-office` 显式以 `source:"bundled"` 注册**（不是文件系统根） | `dsh-skill-office/lib/index.js:71` + `BUNDLED_SKILL_RANK` |
-| 本插件自身：`npm run check` 全绿（typecheck + build + verify **PASS 333/333**），含 **A0**（package.json 解析失败不许崩）、**E 区**（产物契约 / 构建新鲜度 / banner）、**P 区**（发布形态）与本轮新增的写入面断言（A14 / A34–A36、B100–B120、D70–D82） | `npm run check` 的实际输出 |
+| 本插件自身：`npm run check` 全绿（typecheck + build + verify **PASS 296/296**），含本轮新增的 **A0**（package.json 解析失败不许崩）、**E 区**（产物契约 / 构建新鲜度 / banner，E1–E5）与 **P 区**（发布形态，P1–P15） | `npm run check` 的实际输出 |
 | **2026-10-27 本轮反向验证 13/13**：A0 / P1 / P2 / P3 / P4 / P8 / P9 / P11 / P14 / E2 / E3 / E5 / P15 逐条按预期报出断言 id，且注入文件全部逐字节还原 | 记录见 `AGENTS.md` 4.4（含本轮新踩到的两个坑） |
 | `npm pack --dry-run` 实际打出 **15 个文件**：`lib/index.js`、`lib/client.js`、`lib/types/**`（5 个 `.d.ts`）、`lib/.build-manifest.json`、`cordis.patch.yml`、`locale/{en,zh}.json`、`assets/icon.svg`、`README.md`、`LICENSE`、`package.json`；包内**没有** `src/`、`tools/`、`node_modules/`、`.tsbuildinfo`、`*.tgz` | `npm pack --dry-run` 的实际输出（40.3 kB tarball / 111.1 kB unpacked） |
-| **2026-10-27 本轮反向验证 12/12**：A34 / A14 / A15 / A35 / A36 / B105 / B120 / D73 / D72 / D76 / D78 / D80 逐条按预期报出断言 id，注入文件全部逐字节还原 | 脚本输出（`tools/.tmp/reverse.mjs`，跑完即删）；明细见 `AGENTS.md` 4.3 |
-| **2026-10-27 v0.3.0 本轮：`npm run check` 全绿、`node tools/verify.ts` → `PASS 381/381`**（含新断言 A14「恰好两处写入点：`writeSkillFile` / `writeStateFile`」、A34b、B100–B161、D70–D99） | 实际输出 |
-| **2026-10-27 v0.3.0 本轮反向验证 11/11**：两轴写反 / 不备份 removed / origin 一律报 author / 账本不可用报 author / 客户端两开关共用一个 axis / 开关状态都取 `modelInvocable` / chip 在开态也渲染 / 账本写入不带护栏 / 还原后没清账本 / 多出第三处 `writeText` / 账本写入函数被改名 —— 逐条按预期报出断言 id，注入文件全部逐字节还原 | 脚本输出（`tools/.tmp/reverse.mjs`，跑完即删）；明细见 `AGENTS.md` 4.3 |
-| **bundle 升级装得上**：`install_bundle('github:qq540491950/dsh-skill-manager#v0.2.0')` → `application: applied`、`warnings: []`，profile `0.1.0 → 0.2.0` | `plugin_manager` 的实际返回 + profile `package.json` |
-| 历史那一轮 **11/11 反向验证**逐条精确报错（直读兜底 + 诊断下线那一版代码） | 该轮脚本输出（旧骨架，已被 13/13 与 12/12 取代） |
+| 历史那一轮 **11/11 反向验证**逐条精确报错（直读兜底 + 诊断下线那一版代码） | 该轮脚本输出（旧骨架，已被本轮 13/13 取代） |
 
 ### 7.1.1 上游问题：`customSkillDirs` 指向 app.asar（**不是本插件的 bug**）
 
@@ -597,36 +499,30 @@ skill 读回来。（`自定义` 那一格仍受上游影响，因为它指向�
 **边界**：删掉的只是**提示**，不是**数据**。列表、计数、标签页、范围下拉、正文展开
 全部照常渲染（D63/D48/D49 反向钉住）。
 
-### 7.1.4 第三次实测反馈：加「启用 / 关闭」开关（2026-10-27）
+### 7.1.4 第三次实测反馈（2026-10-27）：开关太复杂 → **回到只读**
 
-用户原话：**「现在 skill 管理已经完成，但是能否添加一个启用、关闭的 switch，另外删除这个功能是否支持」**。
+用户原话：**「当前这个设计太复杂了，保持原版的即可，只作为查看只可，不要进行关闭等操作，
+而且页面很臃肿」**。
 
-| 问题 | 结论 | 动作 |
-|---|---|---|
-| 开关能不能做 | **能**，而且不用发明状态：官方 frontmatter 就有 `disable-model-invocation` / `user-invocable` 两个键（`dsh-skill-filesystem` README「Skill format」）。本机 `~/.dsh/skills/ask-matt`、`wait-what` 就写着 `disable-model-invocation: true`，所以它们出现在页面上却不在模型目录里——这条链路是**既有实测事实** | 宿主新增 `op: "set-enabled"`（§5）；客户端行尾加开关 |
-| 删除支持不支持 | **不支持**：`ctx.fs` 的完整契约只有 read/write/edit，**没有 unlink/rmdir/rename**。真删只能 `ctx.subprocess` 起 shell，那会绕过沙箱围栏（围栏在工具层），且 Windows 上 `Remove-Item` 对 junction 有递归删到目标目录的历史 bug —— 而本机 `~/.dsh/skills/*` **全是 junction** | 明确**不做**删除；A35 钉"产物里不许出现删除/起进程的痕迹"。页面保留文件路径，需要删时由用户自己删 |
-| 开关语义选哪种 | 用户选了**一个总开关**：关 = 模型 + `/命令` 都关 | 关 → 写两个键；开 → 删两个键（官方默认即两者皆允许） |
-| 哪些行不能开 | `custom`（位置由 `Config.customSkillDirs` 决定，宿主算不出路径）、`bundled` / `runtime`（随包或运行时注册，没有可改写的文件） | 这些行的开关**置灰**并用 `title` 说明原因（D73/D74）；点了没反应比没有开关更糟 |
+处置：把 `v0.2.0` / `v0.3.0` 引入的写入面**整体撤掉**，源码回到 `v0.1.0` 的只读形态
+（`src/**` 与 `tools/verify.ts` 逐字节回到 `c5abcf6`，`lib/**` 重新构建），版本号进到 `0.4.0`。
 
-### 7.1.5 第四次实测反馈：拆成两个独立开关 + 来源标注 + 可还原（2026-10-27）
+| 撤掉的东西 | 现在的状态 |
+|---|---|
+| 每行的两个开关（`模型` / `/命令`）、`role="switch"`、`aria-checked` | 删除。每行只剩「名字 + 描述 + 提供方徽标 + 查看」 |
+| 来源 chip（`你停用的` / `作者已停用` / `来源未知`）与「还原」按钮 | 删除 |
+| 宿主 `POST { op: "set-invocation" } / { op: "restore-invocation" }` | 删除。接口回到 `GET` 快照 + `POST { op: "read" }` |
+| 账本 `$DSH_HOME/.skill-manager-state.json` | 不再读写 |
+| `writeSkillFile` / `writeStateFile` 两处 `ctx.fs.writeText` 调用点 | 全部删除：宿主半边**零写入**（A14 钉住产物里不出现 `writeText`） |
+| `SkillRow.writable` / `origins` / `restorable` | 从 payload 契约里删除 |
 
-用户原话（要点）：**「把 skill 开关改成『两轴独立 + 来源标注 + 可还原』」**。
-
-| 问题 | 结论 | 动作 |
-|---|---|---|
-| 一个总开关出什么毛病 | 官方那两个键本来是**两个正交轴**（`disable-model-invocation` 只挡模型，`user-invocable: false` 只挡 `/` 菜单）。压成一个总开关后：① 作者只关了一个轴（如 `~/.dsh/skills/ask-matt` 同时写了两个键）在页面上显示为"整体关"；② 分不清"作者原本停用"和"我关的"，而"打开"会把作者原本的声明抹平 | 每行拆成 `模型` / `/命令` **两个开关**，各自读写各自那一行（B104/B131/B132/B134） |
-| 分不清谁关的 | 文件只说"现在关着"，说不出"谁关的" | 新增**账本** `$DSH_HOME/.skill-manager-state.json`：只影响标注与「还原」，**不参与是否生效**（文件才是真相）。三态标注：`你停用的` / `作者已停用` / `来源未知`（B149/B151/B154/B155） |
-| 「打开」抹平了作者的声明 | 旧语义：开 = 删两个键，作者原本只关一个轴也一起没了 | 打开时把被删的**原始行逐字**备份进账本，并给一个「还原」按钮把原行原样写回、清掉该轴记录（B136/B137/B144–B148、D93–D96） |
-| 账本读不出来怎么办 | 若当成"空账本"，所有关着的轴都会被误报成「作者已停用」 | 读不出来一律 `'unknown'`（**未判定 ≠ 作者停用**，延续 §3.8 那条纪律）；账本不可用时**既不写账本也不猜**，功能照常（B152–B156） |
-| 写入面从"一处"变成"两处" | 多了一处账本写入 | A14 从「恰好 1 处」改成「**恰好 2 处**，且分别落在 `writeSkillFile` / `writeStateFile` 里，两处都带护栏」；两处都显式带 `danger-full-access`（B138–B140） |
+**为什么整体回退而不是"留一个开关也行"**：这是用户对使用者体验的判断——设置页是看的地方，
+不是改的地方；一个开关要附带来源标注、还原、备份账本和两处写入护栏，页面和代码都一起变重。
 
 ### 7.2 未实测（不要当成已完成）
 
 | 项 | 为什么没测 | 怎么补 |
 |---|---|---|
-| **开关在真实宿主上写文件** | 自检里的 `ctx.fs` 是替身（写进内存里的 `files` 表）。真实 `fs-sandbox` 的 `writeText` 需要 `stat` 给出 `version`、并按 `sandboxPolicy` 围栏——本插件**显式**传 `{ mode: 'danger-full-access', workspaceRoot }`（见 §5.1）。**这一条是读契约得出的，不是实测** | 重启后到 设置 → Skills 点一次某个项目/全局 skill 的开关，看 `SKILL.md` 里是否多出两行、模型下一步的目录里是否少了它 |
-| **`~/.dsh/skills/*` 是 junction** | 本机 11 个目录全是 junction（`lstat` 类型为 symlink）。`resolve()` 会跟随到真实目标，所以写入落在**目标文件**上（多半是某个 dotfiles 仓库里的技能源）——这符合预期，但没实测过 | 点一个 `user-dsh` 的开关，检查 junction 目标文件是否被改、链接本身没被破坏 |
-| **关掉再打开是否逐字节还原** | 单测里是逐字节比对的（B109），但没在真实文件上跑过（真实文件可能用 CRLF 或块标量 description） | 对同一个 skill 关→开，`git diff` 应为空 |
 | **修复后的页面（直读兜底 + 诊断下线那一版）** | 那些改动都在**宿主半边**（`src/host/index.ts` → 产物 `lib/index.js`）：宿主半边不热重载，产物也不会自己重新构建 —— 必须 `npm run build` **并且**重启 DSH 才看得到 | `npm run build` 后重启 DSH，看 设置 → Skills，并切一次范围下拉 |
 | **直读在真实 `fs-sandbox` 上的读权限** | 自检里 `ctx.fs` 是替身。`fs-sandbox` 的 README 说「读取、列出、元数据操作与 `fs-local` 完全一致；变更围栏不限制观察」，所以直读应当畅通——但**这一条是读文档得出的，不是实测**。若被拒，表现是直读那一路**安静地 0 条**（每根各自兜底，不会报错） | 重启后看 `项目 + 全局` 是否出现 `agent-go` 的那 8 个 skill |
 | **真实 `SKILL.md` 的 frontmatter 是否能被手写解析器吃下** | 自检用的是我自己造的夹具。本机那 8 个文件的真实写法只做过**人工抽查**，没有跑过对比 | 重启后逐个对照：直读列出来的名字应等于官方 `skill` 工具能加载的名字 |
@@ -634,11 +530,8 @@ skill 读回来。（`自定义` 那一格仍受上游影响，因为它指向�
 | **preset 自带 skill 能否恢复** | 取决于上游 `customSkillDirs` 的修复（见 7.1.1） | 修好 profile 后「自定义」分组会出现内容 |
 | **深浅两套主题下的实际观感** | 主题切换未测 | 切换主题看一遍 |
 | `B52` 截断边界之外的超大正文 | 只测了 200010 字符一例 | 可选 |
-| **bundle 真装进 profile** | 2026-10-27 已实测一次：`install_bundle('github:…#v0.2.0')` → `application: applied`、`warnings: []`、profile 里 0.1.0 → 0.2.0（见 §6.7）。**但装完的页面表现仍未实测**——宿主半边要重启 DSH 才会跑新代码 | 重启一次 DSH，看 设置 → Skills 里每行是否多出开关，再点一次项目 skill 的开关 |
-| *| **账本在真实 `fs-sandbox` 上的写入** | 自检里的 `ctx.fs` 是替身。真实写入要过 `checkedTarget` 的围栏（账本在 `$DSH_HOME` 下 = 工作区之外，靠显式 `danger-full-access` 才写得进去），首次落地还要求 `createIfAbsent` 与 `fs-local` 的「no-replace」硬链接语义配合。**读契约 + 单测，未在真实文件上跑过** | 重启后点一次开关，看 `$DSH_HOME/.skill-manager-state.json` 是否出现、`entries` 里是否有那条路径 |
-| **账本 key 与注册表给的 `path` 拼法** | 宿主优先用**直读**算出来的路径当 key（与写入同一份拼法），但若某个 skill **只**存在于注册表（直读没扫到），key 会用注册表给的 `path`——两者的分隔符写法是否总是一致，**未在真实机器上核对** | 若某行关着却显示「作者已停用」，检查账本里的 key 与页面显示的 path 是否只差斜杠方向 |
-| **「还原」写回的位置** | 我们只存行原文、不存行号，所以原行是**追加到 frontmatter 末尾**的（多行保持相对顺序）。单测覆盖了「原行逐字写回」（B145），但"回到原来的那一行"这件事**做不到也不承诺** | 对同一个 skill 关→开→还原，`git diff` 可能只有那一行的位置变化 |
-*`npm publish` / 按 registry 名再装一次** | 本机 `npm whoami` → `ENEEDAUTH`，没有登录 | 登录后 `npm publish --access public`，再 `install_bundle` 包名复验 |
+| **`0.4.0`（只读形态）在真实 GUI 里的表现** | 撤掉开关后的产物只在自检的迷你渲染器里跑过；宿主半边变了，要 `npm run build` + 重启 DSH 才看得到（见 §8）。而且 profile 里现在装的是 `0.3.0`（带开关那版），源码目录的路径行不参与 bundle 运行 | 按 §6.4 就地装 `#v0.4.0` → 重启 DSH → 看 设置 → Skills 每行只剩「名字 + 描述 + 徽标 + 查看」 |
+| **`npm publish` / 按 registry 名再装一次** | 本机 `npm whoami` → `ENEEDAUTH`，没有登录 | 登录后 `npm publish --access public`，再 `install_bundle` 包名复验 |
 | **`npm pack` 的实际内容** | 没跑（清单见 §6.6） | `npm pack` + 解包逐项对照 §6.6 |
 | **包图标在界面里的渲染** | 没看过：`icon` 只进 bundle 清单，座位注册字段里没有它 | 装好后看插件列表/卡片里的图标 |
 
@@ -660,7 +553,8 @@ skill 读回来。（`自定义` 那一格仍受上游影响，因为它指向�
 | 客户端半边会热重载 | 改 `src/client/**` 同样**先要 `npm run build`**；之后**只在 `pnpm run dev:web` 也在跑**时，client-plugin 变更才会免刷新生效；否则要刷新页面。 |
 | **`lib/**` 是生成物** | 源码在 `src/**`。手改 `lib/**` 会被下一次 `npm run build` 覆盖，且 E 区的指纹断言与 CI 的 `git diff --exit-code -- lib` 都会红。 |
 | **手写行与 bundle 安装同 id 冲突** | 两条同 id 条目**不报错**，后插入者赢——表现是"装完看着毫无变化"。迁移顺序见 §6.3。 |
-| **bundle 安装未实测、包未发布** | 见 §6.7：**安装已实测**（v0.2.0 经 `install_bundle` 从 git tag 装进 desktop profile，`application: applied`），但"装完页面长什么样"仍未实测——宿主半边要重启。`npm publish` 仍未做（本机 `npm whoami` → `ENEEDAUTH`）。 |
+| **bundle 已装过、包未发布、页面表现未实测** | 见 §6.7：`v0.2.0` / `v0.3.0` 都真装进过 `desktop` profile（`application: applied`），但"装完页面真的对"从未实测（宿主半边要重启）。`npm publish` 仍未做。 |
+| **刻意不做「启用 / 关闭」开关（2026-10-27 用户要求回退）** | 曾做过两版写入（`v0.2.0` 单开关、`v0.3.0` 两轴 + 来源 + 还原），用户判断"太复杂、页面臃肿"，已**整体撤回到只读**（见 §7.1.4）。要写入时的正路仍是 `ctx.configEditor.edit()` 那类外科手术式编辑，且必须先把页面复杂度算进去。宿主的写入面现在是**零处**（A14）。 |
 | `order` 不保证"永远最后" | 910 只是大于 MCP 的 900。别的插件开更大就会排到后面。 |
 | 同 `(id, priority)` 冲突会抛错 | `id` 的唯一性约束在 `(id, priority)`；`order` 可以重复。所以 `id: "skills"` 不能与别的插件重名。 |
 | 无 session 时没有权威 cwd | 宿主没有「当前工作区」概念。此时 `cwd: undefined`，项目类 skill 可能少列——`resolvedBy` 会如实说明。 |
@@ -669,13 +563,6 @@ skill 读回来。（`自定义` 那一格仍受上游影响，因为它指向�
 | **直读的 frontmatter 解析是手写子集** | 宿主半边零 import，拿不到官方的 `yaml` 包。只实现了 `key: value` / 块标量（`\|`、`>`）/ 引号标量。**比官方严格或宽松的写法都会导致「少列」或「多列」**；因此逐条对齐官方硬性要求，并且宁可漏也不编（B80）。 |
 | **直读不覆盖 `自定义` / `随包内置`** | 前者路径由 `Config.customSkillDirs` 决定，宿主读不到展开值；后者由 `dsh-skill-office` 这类提供方**在内存里**注册。两者都只能来自注册表。 |
 | **直读结果是"盘上有什么"，不是"模型能用什么"** | 提供方健康时两者一致（注册表优先，直读是空操作）。提供方被上游拖死时，直读能把项目/全局 skill **显示**出来，但那个会话的模型**仍然看不到它们**——本插件不改模型可见的目录（绝不 `ctx.skills.register()`）。 |
-| **开关只对四个规范根生效** | `custom` 的路径由 `Config.customSkillDirs` 决定（宿主读不到展开值），`bundled`/`runtime` 没有文件。这三类行的 `writable: false`，行尾**两个**开关都置灰（`title` 说明原因）。 |
-| **不做删除** | `ctx.fs` 没有 unlink/rmdir/rename。真删要起 shell 进程，会绕过沙箱围栏，且对 junction 有递归删目标的风险。要真删请用户自己删文件（页面给了路径）。 |
-| **写入不受会话文件沙箱约束** | 开关是**设置动作**，所以 `writeText` 显式带 `mode: 'danger-full-access'`——会话是 `read-only`/`workspace-write` 时也能改。理由：同一页上的模型选择、插件开关也不受会话文件沙箱约束；目标路径永远由宿主按四个规范根算出，内容只有被点的那一行 frontmatter（外加账本里的一条记录）。这是**有意**的偏离——别"顺手改成跟随会话 mode"，那会让工作区外的 skill 全都改不了（B121/B122）。 |
-| **两个轴不再互相抹平** | 「打开 `模型`」只删 `disable-model-invocation` 那一行，`user-invocable: false` 原样留着（反之亦然）。所以作者"只想关一个轴"的声明**不会被开关顺手改掉**——这正是本轮把总开关拆开要解决的核心问题（B104/B131/B134/B109）。 |
-| **账本只是标注，不是真相** | `$DSH_HOME/.skill-manager-state.json` 丢了/改坏了，只会让关着的轴显示成「来源未知」、「还原」按钮消失；**是否生效永远看文件**。别把它当状态机，也别在没有账本时假装「作者停用」（B152–B156）。 |
-| **「还原」不保证回到原来的行位置** | 账本只存被删掉的行原文（不存行号），所以还原是**追加到 frontmatter 末尾**、多行保序。「原行逐字写回」有断言（B145），「回到它原来那一行」做不到、也不承诺。 |
-| **账本 key 用宿主自己算的路径** | key = 宿主扫出来的 `SKILL.md` 绝对路径（分隔符统一成 `/`）。只存在于注册表、直读没扫到的 skill，key 只能用注册表给的 `path`——那种行万一标注不准，先看两边斜杠写法是否一致。 |
 
 ---
 
