@@ -44,11 +44,25 @@
  * 源码里的相对 `import` **只有类型**（`shared/types.ts`、`./service-types.ts`），
  * 类型擦除后产物里一行 import 都不剩（自检 A8–A10 + E2 钉这条）。
  *
- * ## 只读
+ * ## 写入面：只有一个（启用/关闭开关）
  *
- * 第一阶段**不含任何写入路径**：没有 `ctx.configEditor.edit()`、没有 `ctx.loader.*`、
- * 不碰 `~/.dsh/profiles/**`、不注册任何 skill / 提供方。GET 是纯读；
- * POST 只有 `op: "read"`（读一份 skill 正文）。
+ * 本插件**只有一处写入**，就是 `op: "set-enabled"` 改一个 `SKILL.md` 的 frontmatter：
+ *
+ *   - 关 = 写入 `disable-model-invocation: true` + `user-invocable: false`
+ *     （官方语义：前者让模型目录与 `skill` 工具看不到它，后者让 `/名字` 看不到它）
+ *   - 开 = **删掉这两个键**（官方默认就是两者皆允许，删掉比写 `false` 更干净）
+ *
+ * 三条纪律：
+ *   1. 只改这两行，**其余字节原样保留**（`rewriteInvocation` 逐字节重建头部，正文不动）
+ *   2. 写入一律带版本护栏（`{ kind: 'replaceIfVersion', version }`），并把 gate
+ *      放在 `ctx.fs.writeText` 上——**不用 `editText`**（它是文本匹配式编辑，
+ *      同一个 `description` 可能出现在多处）
+ *   3. **不接受客户端传来的路径**：目标文件由宿主自己按规范根目录算出来（`scanRoot`）
+ *
+ * 没有 `ctx.loader.*`、没有 `ctx.configEditor.edit()`、不碰 `~/.dsh/profiles/**`、
+ * 不注册任何 skill / 提供方。**也没有删除**：`ctx.fs` 的契约里根本没有 unlink/rmdir，
+ * 真删只能起 shell 进程（会绕过沙箱围栏），所以这件事本插件**不做**（见 AGENTS 8）。
+ * GET 仍是纯读；POST 只有 `op: "read"` 与 `op: "set-enabled"`。
  */
 import type { HostContext } from './service-types.ts';
 export declare const name = "dsh-skill-manager";

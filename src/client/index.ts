@@ -13,9 +13,15 @@
  *
  * ## 本插件做什么
  *
- * 往 `settings.section`（**list 座位**）注册一页「Skills」，只读展示已发现的 skill，
- * 按来源分组（项目 / 全局 / 自定义 / 随包内置）。`order: 910` 让它落在设置列表里
- * MCP 页（`dsh-mcp-manager`，`order: 900`）之后。
+ * 往 `settings.section`（**list 座位**）注册一页「Skills」，按来源分组
+ * （项目 / 全局 / 自定义 / 随包内置）浏览已发现的 skill，并给每一行一个
+ * **启用 / 关闭**开关（宿主改 `SKILL.md` 的 frontmatter；不可写的来源置灰）。
+ * `order: 910` 让它落在设置列表里 MCP 页（`dsh-mcp-manager`，`order: 900`）之后。
+ *
+ * 开关是这一页**唯一**的写操作，且刻意做成乐观以外的最朴素形态：点一下 → 一次 POST →
+ * 只改这一行的本地状态，**不整页刷新**（刷新会把列表打回「读取中…」、把展开的正文收掉）。
+ * 它**没有**删除功能：`ctx.fs` 的契约里没有 unlink/rmdir，真删只能起 shell 进程，
+ * 那会绕过沙箱围栏（见 AGENTS 8）。
  *
  * ## 为什么设置页拿得到「当前 session」
  *
@@ -65,7 +71,7 @@
 
 import { createElement, useCallback, useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
-import type { ApiResponse, CatalogPayload, GroupKey, RootRow, SkillBody, SkillRow } from '../shared/types.ts'
+import type { ApiResponse, CatalogPayload, GroupKey, RootRow, SetEnabledResult, SkillBody, SkillRow } from '../shared/types.ts'
 import type { ClientContext } from './service-types.ts'
 
 /** `JSX` 的运行时长啥样：`h(...)` 就是 `react.createElement`（classic 风格，不碰 jsx-runtime）。 */
@@ -297,6 +303,13 @@ const CSS = `
 .dskm-desc { font-size:12px; line-height:16px; color:var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary)); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .dskm-badges { display:flex; align-items:center; flex:none; gap:4px; }
 .dskm-badge { flex:none; display:inline-flex; align-items:center; height:18px; padding:0 6px; border-radius:var(--dsw-radius-sm, 4px); background:var(--dsw-alias-bg-module-platform, var(--dsw-alias-bg-layer-1)); color:var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary)); font-size:11px; line-height:18px; white-space:nowrap; }
+.dskm-switch { box-sizing:border-box; flex:none; position:relative; width:32px; height:18px; padding:0; border:.5px solid var(--dsw-alias-border-l4, var(--dsw-alias-border-l3)); border-radius:9px; background:var(--dsw-alias-bg-layer-2, var(--dsw-alias-bg-layer-1)); cursor:pointer; transition:background .12s ease, border-color .12s ease; }
+.dskm-switch:hover:not(:disabled) { border-color:var(--dsw-alias-border-l3, currentColor); }
+.dskm-switch:focus-visible { outline:var(--dsw-focus-ring-width, 2px) solid var(--dsw-focus-ring-color, var(--dsw-alias-brand-primary)); outline-offset:1px; }
+.dskm-switch:disabled { opacity:.4; cursor:not-allowed; }
+.dskm-switch--on { border-color:transparent; background:var(--dsw-alias-state-business-primary, var(--dsw-alias-brand-primary)); }
+.dskm-knob { position:absolute; top:2px; left:2px; width:12px; height:12px; border-radius:50%; background:var(--dsw-alias-bg-base); transition:transform .12s ease; }
+.dskm-switch--on .dskm-knob { transform:translateX(14px); }
 .dskm-detail { box-sizing:border-box; min-width:0; display:flex; flex-direction:column; gap:6px; margin-top:8px; padding:10px 12px; border-radius:var(--dsw-radius-lg, 8px); background:var(--dsw-alias-bg-module-platform, var(--dsw-alias-bg-layer-1)); }
 .dskm-path { font-size:11px; line-height:16px; color:var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary)); overflow-wrap:anywhere; }
 .dskm-pre { margin:0; max-height:320px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; font-family:ui-monospace, monospace; font-size:11px; line-height:16px; color:var(--dsw-alias-label-secondary); }
@@ -373,18 +386,70 @@ function badge(text: string): ReactNode {
   return h('span', { className: 'dskm-badge', key: text }, text)
 }
 
+/**
+ * 开 / 关一个 skill（宿主改写它 `SKILL.md` 的 frontmatter）。
+ *
+ * 只发**名字**与目标状态：文件路径由宿主自己算（客户端给路径 = 越权）。
+ * 同样带 `sessionId`/`cwd`，保证"我关的是我看到的那个作用的那个文件"。
+ */
+async function setSkillEnabled(
+  sessionId: string | undefined,
+  name: string,
+  enabled: boolean,
+  cwd: string | null,
+): Promise<SetEnabledResult> {
+  const response = await fetch(
+    ROUTE,
+    requestInit({
+      method: 'POST',
+      headers: { accept: 'application/json', 'content-type': 'application/json' },
+      body: JSON.stringify({ op: 'set-enabled', name, enabled, sessionId, cwd: normalizeCwd(cwd) }),
+    }),
+  )
+  const body = (await response.json().catch(() => null)) as ApiResponse<SetEnabledResult> | null
+  if (body === null || body.ok !== true) {
+    throw new Error((body === null || body.ok !== false ? undefined : body.error) ?? `宿主返回 HTTP ${response.status}`)
+  }
+  return body.data
+}
+
+/**
+ * 这一行的开关为什么点不了——**照实说**，不甩一句"不可用"。
+ *
+ * 三种来源三种原因：随包/运行时没有文件、配置目录定位不到、其余未知。
+ */
+function notWritableHint(skill: SkillRow): string {
+  if (skill.source === 'bundled' || skill.source === 'runtime') return '随包内置的 skill 没有可改写的文件，开关不可用'
+  if (skill.source === 'custom') return '这个 skill 在 Config.customSkillDirs 指定的目录里，本页定位不到它的文件'
+  return '这个 skill 没有可改写的文件，开关不可用'
+}
+
+/** 开关当前是开还是关：两个调用策略都允许才算"开着"（总开关语义）。 */
+function isEnabled(skill: SkillRow): boolean {
+  return skill.modelInvocable !== false && skill.userInvocable !== false
+}
+
 interface SkillCardProps {
   skill: SkillRow
   open: OpenState
   onToggle: (skill: SkillRow) => Promise<void>
+  onFlip: (skill: SkillRow) => Promise<void>
+  busy: readonly string[]
 }
 
 /**
  * 一条 skill。点击展开正文——正文按需拉取，不跟着列表一起下来
  * （一个 skill 的 `SKILL.md` 可能几十 KB，全量预取会把列表拖垮）。
+ *
+ * 行尾那个开关是**唯一**的写入入口（宿主改 `SKILL.md` 的 frontmatter）。
+ * 不可写的来源（随包内置 / 配置目录 / 运行时）一律禁用并用 `title` 说明原因。
  */
-function SkillCard({ skill, open, onToggle }: SkillCardProps): ReactNode {
+function SkillCard({ skill, open, onToggle, onFlip, busy }: SkillCardProps): ReactNode {
   const expanded = open.name === skill.name && open.phase !== 'idle'
+  const enabled = isEnabled(skill)
+  const writable = skill.writable === true
+  const pending = busy.includes(skill.name)
+  const hint = writable ? `${enabled ? '停用' : '启用'} ${skill.name}` : notWritableHint(skill)
   return h(
     'li',
     { className: 'dskm-card' },
@@ -415,6 +480,21 @@ function SkillCard({ skill, open, onToggle }: SkillCardProps): ReactNode {
             'aria-expanded': expanded ? 'true' : 'false',
           },
           expanded ? '收起' : '查看',
+        ),
+        h(
+          'button',
+          {
+            type: 'button',
+            role: 'switch',
+            key: 'switch',
+            className: enabled ? 'dskm-switch dskm-switch--on' : 'dskm-switch',
+            'aria-checked': enabled ? 'true' : 'false',
+            'aria-label': hint,
+            title: hint,
+            disabled: !writable || pending,
+            onClick: () => onFlip(skill),
+          },
+          h('span', { className: 'dskm-knob' }),
         ),
       ),
     ),
@@ -487,12 +567,19 @@ function SkillSection(props: SkillSectionProps): ReactNode {
   const [picked, setPicked] = useState<string | null>(null)
   // `null` = 看当前会话（宿主自己取权威 cwd）。选了别的项目才显式传 cwd。
   const [pickedCwd, setPickedCwd] = useState<string | null>(null)
+  // 正在写的那些 skill 名（开关按钮在飞行中要禁用，避免连点两次写出两个状态）。
+  const [busy, setBusy] = useState<readonly string[]>([])
+  // 开关动作失败的原因。**独立于页面相位**：目录是好的，只是这一下没写成，
+  // 不该因此把整个列表打回"读取中"。同一时刻只会有一条（AGENTS 3.7）。
+  const [notice, setNotice] = useState<string | null>(null)
 
   useEffect(() => {
     let alive = true
     setState({ phase: 'loading' })
     // 切换 session/项目时把展开态收掉：正文属于上一个视图，留着会串。
     setOpen({ name: null, phase: 'idle' })
+    // 上一次开关的失败原因属于上一个视图，一并清掉（不留一条过期错误）。
+    setNotice(null)
     fetchCatalog(sessionId, pickedCwd)
       .then((data) => {
         if (alive) setState({ phase: 'ready', data })
@@ -529,6 +616,43 @@ function SkillSection(props: SkillSectionProps): ReactNode {
     [sessionId, pickedCwd, open.name, open.phase],
   )
 
+  /**
+   * 开关一次：发 POST → 成功后**只改这一行**的本地状态。
+   *
+   * 刻意不整页刷新：刷新会把列表打回「读取中…」再回来，用户点一下开关结果整页闪一次，
+   * 而且正在展开的正文也会被收掉。宿主那边的 watcher 已经会让模型目录自更新，
+   * 这里只要显示跟上即可。
+   */
+  const onFlip = useCallback(
+    (skill: SkillRow): Promise<void> => {
+      const next = !isEnabled(skill)
+      setBusy((previous) => (previous.includes(skill.name) ? previous : [...previous, skill.name]))
+      setNotice(null)
+      return setSkillEnabled(sessionId, skill.name, next, pickedCwd)
+        .then((result) => {
+          setState((previous) => {
+            if (previous.phase !== 'ready' || previous.data === undefined) return previous
+            return {
+              phase: 'ready',
+              data: {
+                ...previous.data,
+                skills: previous.data.skills.map((row) =>
+                  row.name === skill.name
+                    ? { ...row, modelInvocable: result.enabled, userInvocable: result.enabled }
+                    : row,
+                ),
+              },
+            }
+          })
+        })
+        .catch((error: unknown) => setNotice(describeError(error)))
+        .then(() => {
+          setBusy((previous) => previous.filter((name) => name !== skill.name))
+        })
+    },
+    [sessionId, pickedCwd],
+  )
+
   const data = state.phase === 'ready' ? state.data : undefined
   const tabs = data === undefined ? [] : buildTabs(data.skills, data.roots)
   // 选中的标签页：用户点过就用他点的；否则**默认落在第一个非空的那一格**，
@@ -552,6 +676,9 @@ function SkillSection(props: SkillSectionProps): ReactNode {
     // 页面级读取失败是**唯一**允许出现的提示：用户需要知道，且能点「刷新」重试。
     // 提供方原文、作用域/cwd/提供方/完整性这些诊断**一律不再渲染**（用户要求）。
     state.phase === 'failed' ? h('div', { className: 'dskm-notice dskm-notice--error' }, state.error) : null,
+
+    // 开关动作失败：目录本身是好的，所以它**只**说这一下为什么没写成，不动列表。
+    notice === null ? null : h('div', { className: 'dskm-notice dskm-notice--error' }, notice),
 
     h(
       'div',
@@ -642,7 +769,7 @@ function SkillSection(props: SkillSectionProps): ReactNode {
             : h(
                 'ul',
                 { className: 'dskm-rows' },
-                tab.items.map((skill) => h(SkillCard, { key: skill.name, skill, open, onToggle })),
+                tab.items.map((skill) => h(SkillCard, { key: skill.name, skill, open, onToggle, onFlip, busy })),
               ),
         ),
   )

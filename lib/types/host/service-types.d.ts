@@ -73,13 +73,23 @@ export interface SkillRegistry {
         signal?: AbortSignal;
     }): Promise<SkillDetail | undefined>;
 }
-/** `ctx.fs`：只用 resolve / listDir / readText / stat / lstat 五个成员。 */
+/**
+ * `ctx.fs`：只用 resolve / listDir / readText / stat / lstat / writeText 六个成员。
+ *
+ * `writeText` 是本插件**唯一**的写入出口（只用来改 `SKILL.md` 的 frontmatter）；
+ * `stat` 的 `version` 是写入护栏（`replaceIfVersion`）的凭证，拿不到版本就不写。
+ */
 export interface FsEntry {
     name?: unknown;
     type?: unknown;
     target?: {
         displayPath?: unknown;
     } | undefined;
+}
+/** 写入意图：本插件只用 `replaceIfVersion`（无护栏的覆盖一律不做）。 */
+export interface FsWriteIntent {
+    kind: 'replaceIfVersion';
+    version: string;
 }
 export interface FsService {
     resolve(path: string, options?: {
@@ -89,8 +99,10 @@ export interface FsService {
     readText(target: string, signal?: AbortSignal): Promise<unknown>;
     stat?(target: string, signal?: AbortSignal): Promise<{
         type?: unknown;
+        version?: unknown;
     } | undefined>;
     lstat?(path: string): Promise<unknown>;
+    writeText?(target: string, content: string, expected?: FsWriteIntent, signal?: AbortSignal): Promise<unknown>;
 }
 /** `ctx.sessionQuery`：`observeSession()` 返回 **caller-owned** 租约，读完必须释放。 */
 export interface SessionObservation {

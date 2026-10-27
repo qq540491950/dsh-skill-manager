@@ -8,14 +8,16 @@
 
 ## 0. 30 秒定位
 
-**这是什么**：一个 DSH 插件，在设置面板加一页「Skills」，**只读**浏览当前会话可见的
-skill，按来源分组（项目 / 全局 / 自定义 / 随包内置）。**第一阶段没有任何写入路径。**
+**这是什么**：一个 DSH 插件，在设置面板加一页「Skills」，浏览当前会话可见的 skill，
+按来源分组（项目 / 全局 / 自定义 / 随包内置），并给每一行一个**启用 / 关闭**开关。
+**写入面只有一个**：开关改写那份 `SKILL.md` 的 frontmatter（`disable-model-invocation` /
+`user-invocable` 两键，见 2.13）。**没有删除**——`ctx.fs` 没有 unlink/rmdir/rename（见 8）。
 
 **双半结构**（源码在 `src/**`，`lib/**` 是 `tools/build.ts` 生成的产物，见 2.11）：
 
 | 半边 | 源码 | 产物（运行时读的就是它） | 职责 |
 |---|---|---|---|
-| 宿主 | `src/host/index.ts`（+ `src/host/service-types.ts`） | `lib/index.js` | **产物零 import**。`ctx.connection.fetch.register()` 开 `/api/skill-manager`；解析作用域后读 `ctx.skills`，**并只读直读四个规范根目录**（见 2.10）。 |
+| 宿主 | `src/host/index.ts`（+ `src/host/service-types.ts`） | `lib/index.js` | **产物零 import**。`ctx.connection.fetch.register()` 开 `/api/skill-manager`；解析作用域后读 `ctx.skills`，**并只读直读四个规范根目录**（见 2.10）；唯一的写入点是 `set-enabled`（见 2.13）。 |
 | 客户端 | `src/client/index.ts`（+ `src/client/service-types.ts`） | `lib/client.js` | `window.__ModuleLoader__` 懒 CJS bundle（包装由构建脚本注入，`id` 取自 `package.json.name`）。注册 `settings.section`（list 座位，`order: 910`）。 |
 | 共用 | `src/shared/types.ts` | 无（只有类型，被擦除） | payload 契约：两边各写一遍必然漂。 |
 
@@ -270,6 +272,36 @@ profile 的 `customSkillDirs` 指向 `app.asar` 内的 `<agent-preset>/skills`�
 profile 本轮**没有被改动**，所以"装进 profile 后页面真的能用"这件事**未实测**。
 写文档时不许把它写成已验证。
 
+### 2.13 写入面**只有一个**：`set-enabled` 改写 `SKILL.md` 的 frontmatter
+
+2026-10-27 用户要求加「启用 / 关闭」开关，插件因此不再是纯只读。规则是**收窄，不是放开**：
+
+| 允许 | 禁止 |
+|---|---|
+| `ctx.fs.writeText`（唯一调用点，A14 数"恰好 1 处"） | `ctx.configEditor.edit()`（A11）、`ctx.loader.create()/remove()`（A12/A13） |
+| 带 `{ kind: 'replaceIfVersion', version }` 的写入（A34） | 无护栏覆盖；`ctx.fs.editText`（A15）——文本匹配式编辑会撞重复片段 |
+| 只改 `disable-model-invocation` / `user-invocable` 两行 | 重排/重写 frontmatter 其它键（B105/B109 用"关→开逐字节还原"钉住） |
+| 目标文件由宿主按规范根自己算（`scanRoot`） | 接受客户端传来的路径（A36、B114） |
+| 不可写的来源**拒绝且零写入**（B110–B113） | 起 shell 进程 / 删除文件（A35；`ctx.fs` 根本没有 unlink/rmdir） |
+
+几条容易抄近路的地方：
+
+- **开关语义是官方的，不要另造状态**：`disable-model-invocation: true` 让模型目录与
+  `skill` 工具看不到它，`user-invocable: false` 让 `/名字` 看不到它（`dsh-skill-filesystem`
+  README「Skill format」）。本机 `~/.dsh/skills/ask-matt` 就写着前者，所以它出现在页面上
+  却不在模型目录里——这是**既有事实**，不是我们的约定。
+- 一个总开关（用户选定）：关 = 写两个键；开 = **删**两个键（官方默认即两者皆允许）。
+  代价：会抹平用户手写的 `user-invocable: false`（写进 README §8）。
+- `writable` 由**来源**决定，不由"文件在不在"决定：`custom`（路径由 Config 决定，算不出来）
+  与 `bundled`/`runtime`（无文件）一律 false → 界面置灰说明原因。**点了没反应比没有开关更糟。**
+- 生效不需要重启：provider watch 每个根，写完自己 invalidate。
+
+### 2.14 客户端开关：只改这一行，不整页刷新
+
+`onFlip` 成功后**只 patch 那一行**的 `modelInvocable`/`userInvocable`。别改 `nonce` 触发整页
+重读——那会把列表打回「读取中…」、把展开的正文收掉（D79/D80 钉住）。失败信息走**独立**的
+`notice` 状态单独渲染一句，不把页面相位打成 failed（列表还在，只是这一下没写成）。
+
 ---
 
 ## 3. UI 纪律
@@ -384,7 +416,7 @@ npm run check              # typecheck + build + verify，交付前跑这条
 
 | 区 | 覆盖 |
 |---|---|
-| A | 静态护栏：包清单 / 座位注册形状 / 主题与 inline 纪律 / 零 import / 只读性 / 编码 |
+| A | 静态护栏：包清单 / 座位注册形状 / 主题与 inline 纪律 / 零 import / **写入面（唯一写点 + 版本护栏 + 不删除 + 不收客户端路径）/ 编码** |
 | B | **宿主半边行为**：假 ctx 真跑 `apply`、真发 `Request`，断言解析链、租约释放、分组、读取、**直读兜底与合并规则** |
 | C | 客户端协议：假 `window.__ModuleLoader__` 真跑 factory，断言座位注册项与 require 面 |
 | D | **真实渲染**：迷你渲染器展开函数组件（含 hook 顺序计数），覆盖就绪/空/失败/**无诊断**/展开正文 |
@@ -447,6 +479,23 @@ B54 不返回 roots / B64 未判定误报为不存在 / B68 探测出错就整�
 | 把「完整性 未完成」/ 事实面板塞回页面 | D8、D47、D52、D62 |
 | 把 `providerFailures` 塞回 payload | B90 |
 | 正文读取不回退到直读 | B92–B94 |
+
+**本轮（启用/关闭开关）新增的注入面**——全部实测报出（12/12，见下）：
+
+| 注入 | 报出 | 连带 |
+|---|---|---|
+| 写入丢掉 `{ kind: 'replaceIfVersion' }` 护栏 | A34 | B106 |
+| 多出第二个 `writeText` 调用点 | A14 | B102/B107/B109 |
+| 产物里出现 `editText` | A15 | — |
+| 产物里出现 `subprocess`（起进程/删除） | A35 | — |
+| 从请求里取 `payload.path` | A36 | B100–B109、B114（该注入让用例整体抛错，属连带） |
+| 重写 frontmatter 时丢掉其它键（只留 `description:`） | B105 | B109、B107/B108 |
+| `writable` 一律标成 `true` | B120 | — |
+| 不可写来源的开关不禁用 | D73 | — |
+| 开关 `aria-checked` 永远 `'true'` | D72 | D80 |
+| 开关 POST 送的是 `!enabled` | D76 | — |
+| 开关 POST 里塞了 `path` | D78 | — |
+| 切换后整页刷新（本地状态不跟上） | D80 | — |
 
 > ⚠️ **锚点会随代码过期**：每轮重构之后，上一轮的注入锚点可能已不存在
 > （`if (sessionId !== undefined) params.set(...)`、`buildTabs` 取代 buckets 都发生过）。
@@ -611,4 +660,6 @@ effect 里的数据链是 `async/await` + `.then(setState)`。只 `await` 一个
 | **包图标渲染未见** | `assets/icon.svg` 只是 bundle 清单字段；座位注册字段白名单里没有 `icon`（3.4），它不进导航图标。界面里实际什么样**没看过** |
 | **上游 provider 会被一个坏根目录整条拖死** | `dsh-skill-filesystem.list()` 没有 per-root try/catch。**本插件用直读兜底（见 2.10），但那不等于上游修好了**：`customSkillDirs`（本机指向 app.asar 内的 `<agent-preset>/skills`）仍然读不出来，「自定义」分组因此仍可能是 0。修它属于 profile 配置，不归本插件。 |
 | **直读的 frontmatter 解析是子集** | 宿主半边零 import，拿不到官方的 `yaml` 包，只实现了 `key: value` / 块标量 / 引号标量。比官方严格或宽松的写法都会导致「少列」或「多列」。因此**逐条对齐官方的硬性要求**（B80），并且**宁可漏也不编**。 |
-| 阶段一没有写入 | 这是范围，不是缺口。要加写入时，走 `ctx.configEditor.edit()`（外科手术式 YAML 编辑），**禁止** `ctx.loader.create()/remove()`（`EntryTree.write()` 会整体重写、压平用户手写的 `insert:` 分节） |
+| 写入面只有一处（`set-enabled`） | 见 2.13。改 skill 的**生效方式**只有"改 `SKILL.md` 的 frontmatter"这一条；`custom`（Config 决定位置）/ `bundled` / `runtime` 没有可定位的文件，开关必须置灰。**不要**为了"让开关也能点"去起 shell 进程。 |
+| **不做删除** | `ctx.fs` 的契约里没有 unlink/rmdir/rename。真删要 `ctx.subprocess` 起 shell（绕过沙箱围栏），且 Windows 上 `Remove-Item` 对 junction 有递归删目标的风险——本机 `~/.dsh/skills/*` 全是 junction。页面给路径，用户自己删。A35 钉住"产物里不许出现删除/起进程的痕迹"。 |
+| 总开关会抹平手写的 `user-invocable: false` | "开" = 删两个键（官方默认两者皆允许）。若某个 skill 只想关掉 `/菜单`、保留模型自动调用，关→开之后这条意图就没了。单开关语义的**已知代价**。 |

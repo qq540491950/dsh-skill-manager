@@ -35,6 +35,14 @@ export interface SkillRow {
     provider?: string | undefined;
     modelInvocable: boolean;
     userInvocable: boolean;
+    /**
+     * 这一行的开关**能不能点**。
+     *
+     * 只有「项目 / 全局」四个规范根里的 skill 可写（宿主算得出路径、也写得进去）。
+     * `custom`（位置由 Config 决定）、`bundled` / `runtime`（随包或运行时注册）都不可写——
+     * 开关必须置灰，**点了没反应比没有开关更糟**。
+     */
+    writable: boolean;
     resourceKind?: string | undefined;
 }
 /**
@@ -80,6 +88,18 @@ export interface SkillBody {
     content: string;
     truncated: boolean;
     contentLength: number;
+}
+/**
+ * POST `op: "set-enabled"` 的 `data`。
+ *
+ * `changed: false` 表示"它本来就是那个状态"——宿主**没有写文件**。
+ * 客户端据此不要做任何本地变更（也不会多一次 provider 重扫）。
+ */
+export interface SetEnabledResult {
+    name: string;
+    path?: string | undefined;
+    enabled: boolean;
+    changed: boolean;
 }
 /** 路由响应包络：成功带 `data`，失败**没有** `data`（自检 5.5 钉这条）。 */
 export type ApiResponse<TData> = {

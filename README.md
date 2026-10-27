@@ -1,11 +1,15 @@
 # dsh-skill-manager
 
-DSH Web 客户端插件：在**设置面板**里加一页「Skills」，**只读**浏览当前会话可见的 skill，
-按来源分组（项目 / 全局 / 自定义 / 随包内置）。
+DSH Web 客户端插件：在**设置面板**里加一页「Skills」，按来源分组
+（项目 / 全局 / 自定义 / 随包内置）浏览当前会话可见的 skill，并给每一行一个
+**启用 / 关闭**开关。
 
-**第一阶段范围**：只做查看。没有任何创建、编辑、删除、启停路径——没有
-`ctx.configEditor.edit()`，不碰 `~/.dsh/profiles/**`，不碰 `ctx.loader.*`。
-`tools/verify.ts` 的 A11–A15 就是钉这条纪律的。
+**写入面只有一个**（2026-10-27 从"纯只读"扩出来的）：开关改写那份 `SKILL.md` 的
+frontmatter —— 关 = 写 `disable-model-invocation: true` + `user-invocable: false`，
+开 = 删掉这两个键。写入一律带 `replaceIfVersion` 版本护栏，目标文件由宿主自己按规范根
+算出来（客户端只能给名字）。仍然没有 `ctx.configEditor.edit()`、不碰
+`~/.dsh/profiles/**`、不碰 `ctx.loader.*`，**也没有删除**（`ctx.fs` 没有 unlink/rmdir，
+真删只能起 shell 进程并绕过沙箱围栏）。`tools/verify.ts` 的 A11–A15 / A34–A36 钉这条纪律。
 
 ```powershell
 npm run check              # typecheck + build + verify（交付前跑这条）
@@ -20,7 +24,7 @@ node tools/verify.ts       # 只跑自检；零依赖，不装 node_modules 也�
 
 | 半边 | 源码 | 产物 | 职责 |
 |---|---|---|---|
-| 宿主 | `src/host/index.ts`（+ `service-types.ts`） | `lib/index.js`（ESM 单文件） | **产物零 import**。用 `ctx.connection.fetch.register()` 开一条只读路由 `/api/skill-manager`，内部解析作用域后读 `ctx.skills`，**并只读直读四个规范根目录**（§3.3）。 |
+| 宿主 | `src/host/index.ts`（+ `service-types.ts`） | `lib/index.js`（ESM 单文件） | **产物零 import**。用 `ctx.connection.fetch.register()` 开一条路由 `/api/skill-manager`（GET 纯读 + 两个 POST：`read` / `set-enabled`），内部解析作用域后读 `ctx.skills`，**并只读直读四个规范根目录**（§3.3）。写入面只有一处：改 `SKILL.md` 的 frontmatter（§5.1）。 |
 | 客户端 | `src/client/index.ts`（+ `service-types.ts`） | `lib/client.js`（懒 CJS 工厂） | `window.__ModuleLoader__` 懒 CJS bundle（包装与 `id` 由构建脚本注入）。往 `settings.section`（list 座位，`order: 910`）注册一页，同源 `fetch` 取数并渲染。 |
 | 共用 | `src/shared/types.ts` | 无（只有类型，被擦除） | 两半边共用的 payload 契约。 |
 
@@ -213,6 +217,9 @@ skill 也一起消失**——页面上表现为「选了项目还是只有随包
       "provider": "filesystem",
       "modelInvocable": true,
       "userInvocable": true,
+      // 开关能不能点：只有四个规范根（项目 ×2 + 用户 ×2）里的 skill 为 true。
+      // custom 由 Config 决定位置、bundled/runtime 没有文件 → false（界面置灰并说明原因）。
+      "writable": true,
       "resourceKind": "directory"    // 可选
     }],
     "counts": { "project": 0, "global": 0, "custom": 3, "bundled": 0, "other": 0 },
@@ -235,7 +242,7 @@ skill 也一起消失**——页面上表现为「选了项目还是只有随包
     "presetId": "cordis",           // 可选
     "cwd": "D:/project/…",          // 可选；无 sessionId 时为 undefined
     "route": "/api/skill-manager",
-    "capabilities": ["snapshot", "read"]
+    "capabilities": ["snapshot", "read", "set-enabled"]
   }
 }
 ```
@@ -257,6 +264,32 @@ skill 也一起消失**——页面上表现为「选了项目还是只有随包
 （B92–B96 钉这条。）
 
 失败一律 `4xx/5xx` + `{ ok: false, error }`，错误原文直接给用户看。未知 `op` → 400。
+
+### `POST { "op": "set-enabled", "name": "<skill>", "enabled": <bool>, "sessionId": "<id>", "cwd": "<path>" }`
+
+本插件**唯一**的写操作：改写那份 `SKILL.md` 的 frontmatter。
+
+| 目标状态 | 写入内容 | 官方语义（`dsh-skill-filesystem` README「Skill format」） |
+|---|---|---|
+| `enabled: false` | `disable-model-invocation: true` + `user-invocable: false` | 模型目录与 `skill` 工具看不到它；`/名字` 也看不到它 |
+| `enabled: true` | 删掉这两个键 | 官方默认两者皆允许，删键比写 `false` 更干净 |
+
+返回 `{ name, path?, enabled, changed }`；`changed: false` = 它本来就是那个状态，**宿主没有写文件**。
+
+纪律（A14 / A34–A36、B100–B120 钉住）：
+
+- **只改这两行**，其余字节原样保留（`rewriteInvocation` 逐字节重建头部，正文不动）——
+  所以「关 → 开」能逐字节回到原文件（B109）。
+- 每次写都带 `{ kind: 'replaceIfVersion', version }` 护栏；拿不到版本就**不写**。
+- 用 `writeText` 整文件替换而**不用 `editText`**：文本匹配式编辑可能撞上重复的
+  `description` 片段。
+- **不接受客户端给的路径**：目标文件由宿主按规范根自己算（B114）。
+- 不可写的来源（`custom` / `bundled` / `runtime`）一律 409 + 说明原因，且**一个字节都不写**（B110–B113）。
+- 生效不需要重启：provider watch 着每个根，`SKILL.md` 一改就 invalidate，模型下一步拿到替换后的目录。
+
+**没有删除。** `ctx.fs` 的契约里没有 unlink/rmdir/rename，真删只能 `ctx.subprocess`
+起一条 shell —— 那会绕过沙箱围栏（围栏在工具层），且 Windows 上 `Remove-Item` 对
+junction 有递归删到目标目录的历史 bug。A35 就是钉"产物里不许出现删除/起进程的痕迹"。
 
 ---
 
@@ -425,7 +458,7 @@ lib  cordis.patch.yml  locale/*.json  assets/icon.svg  README.md  LICENSE
 | **项目根里确实有 skill**：`D:\project\agent-go\.agents\skills` 存在，含 8 个 `SKILL.md`（`edd-prototype`/`git-commit`/`git-push`/`handoff`/`personal-weekly-report`/`req`/`wails3-upgrade`/`weekly-report`） | 直接列目录（第二次实测期间） |
 | **本机确实没有项目/全局 skill（第一次实测时）**：`.dsh/skills`、`.agents/skills`（项目侧）与 `~/.dsh/skills` 都不存在，`~/.agents/skills` 存在但为空 | 直接列目录 |
 | **`dsh-skill-office` 显式以 `source:"bundled"` 注册**（不是文件系统根） | `dsh-skill-office/lib/index.js:71` + `BUNDLED_SKILL_RANK` |
-| 本插件自身：`npm run check` 全绿（typecheck + build + verify **PASS 296/296**），含本轮新增的 **A0**（package.json 解析失败不许崩）、**E 区**（产物契约 / 构建新鲜度 / banner，E1–E5）与 **P 区**（发布形态，P1–P15） | `npm run check` 的实际输出 |
+| 本插件自身：`npm run check` 全绿（typecheck + build + verify **PASS 333/333**），含 **A0**（package.json 解析失败不许崩）、**E 区**（产物契约 / 构建新鲜度 / banner）、**P 区**（发布形态）与本轮新增的写入面断言（A14 / A34–A36、B100–B120、D70–D82） | `npm run check` 的实际输出 |
 | **2026-10-27 本轮反向验证 13/13**：A0 / P1 / P2 / P3 / P4 / P8 / P9 / P11 / P14 / E2 / E3 / E5 / P15 逐条按预期报出断言 id，且注入文件全部逐字节还原 | 记录见 `AGENTS.md` 4.4（含本轮新踩到的两个坑） |
 | `npm pack --dry-run` 实际打出 **15 个文件**：`lib/index.js`、`lib/client.js`、`lib/types/**`（5 个 `.d.ts`）、`lib/.build-manifest.json`、`cordis.patch.yml`、`locale/{en,zh}.json`、`assets/icon.svg`、`README.md`、`LICENSE`、`package.json`；包内**没有** `src/`、`tools/`、`node_modules/`、`.tsbuildinfo`、`*.tgz` | `npm pack --dry-run` 的实际输出（40.3 kB tarball / 111.1 kB unpacked） |
 | 历史那一轮 **11/11 反向验证**逐条精确报错（直读兜底 + 诊断下线那一版代码） | 该轮脚本输出（旧骨架，已被本轮 13/13 取代） |
@@ -498,10 +531,24 @@ skill 读回来。（`自定义` 那一格仍受上游影响，因为它指向�
 **边界**：删掉的只是**提示**，不是**数据**。列表、计数、标签页、范围下拉、正文展开
 全部照常渲染（D63/D48/D49 反向钉住）。
 
+### 7.1.4 第三次实测反馈：加「启用 / 关闭」开关（2026-10-27）
+
+用户原话：**「现在 skill 管理已经完成，但是能否添加一个启用、关闭的 switch，另外删除这个功能是否支持」**。
+
+| 问题 | 结论 | 动作 |
+|---|---|---|
+| 开关能不能做 | **能**，而且不用发明状态：官方 frontmatter 就有 `disable-model-invocation` / `user-invocable` 两个键（`dsh-skill-filesystem` README「Skill format」）。本机 `~/.dsh/skills/ask-matt`、`wait-what` 就写着 `disable-model-invocation: true`，所以它们出现在页面上却不在模型目录里——这条链路是**既有实测事实** | 宿主新增 `op: "set-enabled"`（§5）；客户端行尾加开关 |
+| 删除支持不支持 | **不支持**：`ctx.fs` 的完整契约只有 read/write/edit，**没有 unlink/rmdir/rename**。真删只能 `ctx.subprocess` 起 shell，那会绕过沙箱围栏（围栏在工具层），且 Windows 上 `Remove-Item` 对 junction 有递归删到目标目录的历史 bug —— 而本机 `~/.dsh/skills/*` **全是 junction** | 明确**不做**删除；A35 钉"产物里不许出现删除/起进程的痕迹"。页面保留文件路径，需要删时由用户自己删 |
+| 开关语义选哪种 | 用户选了**一个总开关**：关 = 模型 + `/命令` 都关 | 关 → 写两个键；开 → 删两个键（官方默认即两者皆允许） |
+| 哪些行不能开 | `custom`（位置由 `Config.customSkillDirs` 决定，宿主算不出路径）、`bundled` / `runtime`（随包或运行时注册，没有可改写的文件） | 这些行的开关**置灰**并用 `title` 说明原因（D73/D74）；点了没反应比没有开关更糟 |
+
 ### 7.2 未实测（不要当成已完成）
 
 | 项 | 为什么没测 | 怎么补 |
 |---|---|---|
+| **开关在真实宿主上写文件** | 自检里的 `ctx.fs` 是替身（写进内存里的 `files` 表）。真实 `fs-sandbox` 的 `writeText` 需要 `stat` 给出 `version`、并按 `sandboxPolicy` 围栏——本插件调用时不带 policy，落到后端的 agentless 兜底（本 profile 默认 `danger-full-access`）。**这一条是读契约得出的，不是实测** | 重启后到 设置 → Skills 点一次某个项目/全局 skill 的开关，看 `SKILL.md` 里是否多出两行、模型下一步的目录里是否少了它 |
+| **`~/.dsh/skills/*` 是 junction** | 本机 11 个目录全是 junction（`lstat` 类型为 symlink）。`resolve()` 会跟随到真实目标，所以写入落在**目标文件**上（多半是某个 dotfiles 仓库里的技能源）——这符合预期，但没实测过 | 点一个 `user-dsh` 的开关，检查 junction 目标文件是否被改、链接本身没被破坏 |
+| **关掉再打开是否逐字节还原** | 单测里是逐字节比对的（B109），但没在真实文件上跑过（真实文件可能用 CRLF 或块标量 description） | 对同一个 skill 关→开，`git diff` 应为空 |
 | **修复后的页面（直读兜底 + 诊断下线那一版）** | 那些改动都在**宿主半边**（`src/host/index.ts` → 产物 `lib/index.js`）：宿主半边不热重载，产物也不会自己重新构建 —— 必须 `npm run build` **并且**重启 DSH 才看得到 | `npm run build` 后重启 DSH，看 设置 → Skills，并切一次范围下拉 |
 | **直读在真实 `fs-sandbox` 上的读权限** | 自检里 `ctx.fs` 是替身。`fs-sandbox` 的 README 说「读取、列出、元数据操作与 `fs-local` 完全一致；变更围栏不限制观察」，所以直读应当畅通——但**这一条是读文档得出的，不是实测**。若被拒，表现是直读那一路**安静地 0 条**（每根各自兜底，不会报错） | 重启后看 `项目 + 全局` 是否出现 `agent-go` 的那 8 个 skill |
 | **真实 `SKILL.md` 的 frontmatter 是否能被手写解析器吃下** | 自检用的是我自己造的夹具。本机那 8 个文件的真实写法只做过**人工抽查**，没有跑过对比 | 重启后逐个对照：直读列出来的名字应等于官方 `skill` 工具能加载的名字 |
@@ -541,6 +588,9 @@ skill 读回来。（`自定义` 那一格仍受上游影响，因为它指向�
 | **直读的 frontmatter 解析是手写子集** | 宿主半边零 import，拿不到官方的 `yaml` 包。只实现了 `key: value` / 块标量（`\|`、`>`）/ 引号标量。**比官方严格或宽松的写法都会导致「少列」或「多列」**；因此逐条对齐官方硬性要求，并且宁可漏也不编（B80）。 |
 | **直读不覆盖 `自定义` / `随包内置`** | 前者路径由 `Config.customSkillDirs` 决定，宿主读不到展开值；后者由 `dsh-skill-office` 这类提供方**在内存里**注册。两者都只能来自注册表。 |
 | **直读结果是"盘上有什么"，不是"模型能用什么"** | 提供方健康时两者一致（注册表优先，直读是空操作）。提供方被上游拖死时，直读能把项目/全局 skill **显示**出来，但那个会话的模型**仍然看不到它们**——本插件不改模型可见的目录（绝不 `ctx.skills.register()`）。 |
+| **开关只对四个规范根生效** | `custom` 的路径由 `Config.customSkillDirs` 决定（宿主读不到展开值），`bundled`/`runtime` 没有文件。这三类行的 `writable: false`，开关置灰。 |
+| **不做删除** | `ctx.fs` 没有 unlink/rmdir/rename。真删要起 shell 进程，会绕过沙箱围栏，且对 junction 有递归删目标的风险。要真删请用户自己删文件（页面给了路径）。 |
+| **总开关会抹掉手写的 `user-invocable: false`** | "开"= 删掉两个键（官方默认两者皆允许）。若某个 skill 原本只写了 `user-invocable: false`（想保留给模型自动调用、但不进 `/` 菜单），把开关关掉再打开会把这条意图抹平。单开关语义的**已知代价**，不是 bug。 |
 
 ---
 

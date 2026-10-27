@@ -44,14 +44,28 @@
  * 源码里的相对 `import` **只有类型**（`shared/types.ts`、`./service-types.ts`），
  * 类型擦除后产物里一行 import 都不剩（自检 A8–A10 + E2 钉这条）。
  *
- * ## 只读
+ * ## 写入面：只有一个（启用/关闭开关）
  *
- * 第一阶段**不含任何写入路径**：没有 `ctx.configEditor.edit()`、没有 `ctx.loader.*`、
- * 不碰 `~/.dsh/profiles/**`、不注册任何 skill / 提供方。GET 是纯读；
- * POST 只有 `op: "read"`（读一份 skill 正文）。
+ * 本插件**只有一处写入**，就是 `op: "set-enabled"` 改一个 `SKILL.md` 的 frontmatter：
+ *
+ *   - 关 = 写入 `disable-model-invocation: true` + `user-invocable: false`
+ *     （官方语义：前者让模型目录与 `skill` 工具看不到它，后者让 `/名字` 看不到它）
+ *   - 开 = **删掉这两个键**（官方默认就是两者皆允许，删掉比写 `false` 更干净）
+ *
+ * 三条纪律：
+ *   1. 只改这两行，**其余字节原样保留**（`rewriteInvocation` 逐字节重建头部，正文不动）
+ *   2. 写入一律带版本护栏（`{ kind: 'replaceIfVersion', version }`），并把 gate
+ *      放在 `ctx.fs.writeText` 上——**不用 `editText`**（它是文本匹配式编辑，
+ *      同一个 `description` 可能出现在多处）
+ *   3. **不接受客户端传来的路径**：目标文件由宿主自己按规范根目录算出来（`scanRoot`）
+ *
+ * 没有 `ctx.loader.*`、没有 `ctx.configEditor.edit()`、不碰 `~/.dsh/profiles/**`、
+ * 不注册任何 skill / 提供方。**也没有删除**：`ctx.fs` 的契约里根本没有 unlink/rmdir，
+ * 真删只能起 shell 进程（会绕过沙箱围栏），所以这件事本插件**不做**（见 AGENTS 8）。
+ * GET 仍是纯读；POST 只有 `op: "read"` 与 `op: "set-enabled"`。
  */
 
-import type { CatalogPayload, GroupKey, RootRow, SkillBody, SkillRow } from '../shared/types.ts'
+import type { CatalogPayload, GroupKey, RootRow, SetEnabledResult, SkillBody, SkillRow } from '../shared/types.ts'
 import type {
   AgentPresetsService,
   AgentsService,
@@ -125,6 +139,26 @@ const GROUPS: Record<string, GroupKey> = {
 /** 分组顺序 = 界面上的分节顺序。 */
 const GROUP_ORDER: readonly GroupKey[] = ['project', 'global', 'custom', 'bundled', 'other']
 
+/**
+ * 哪些来源的 skill **有本插件自己定位得到、也写得进去的文件**。
+ *
+ * 只有这四个规范根满足条件——它们的路径由 `standardRoots` 自己算出来（来自 env 与
+ * projectRoot），既可信又可写。另外三个来源都不行：
+ *   - `custom`：位置由 `Config.customSkillDirs` 决定，宿主半边读不到展开值（可能在
+ *     app.asar 里），算不出路径 → 不给写，界面上开关置灰
+ *   - `bundled` / `runtime`：随包分发 / 运行时注册，没有可编辑的 `SKILL.md`
+ *
+ * 开关只在能真正生效的时候才可点。**点了没反应比没有开关更糟。**
+ */
+const WRITABLE_SOURCES: readonly string[] = ['project-dsh', 'project-agents', 'user-dsh', 'user-agents']
+
+/**
+ * frontmatter 里的调用策略键（出现即视为"这一行由本插件管理"）。
+ *
+ * 只认**顶格**的键：缩进行属于上一个键的块标量，不能碰。
+ */
+const INVOCATION_KEY_LINE = /^(?:disable-model-invocation|user-invocable)\s*:/
+
 export const name = 'dsh-skill-manager'
 /** 依赖在 apply 内用 ctx.inject 声明，便于缺失服务时优雅降级而不是抛错。 */
 export const inject: readonly string[] = []
@@ -139,6 +173,18 @@ interface QueryOptions {
 /** `op: "read"` 的入参。`name` 原样收，收窄交给 `readSkill`。 */
 interface ReadOptions extends QueryOptions {
   name?: unknown
+}
+
+/** `op: "set-enabled"` 的入参。同上，收窄在 `setSkillEnabled` 里做。 */
+interface SetEnabledOptions extends QueryOptions {
+  name?: unknown
+}
+
+/** 一份可写文件：目标句柄 + 当前正文 + 版本（版本是并发的写入护栏）。 */
+interface WritableFile {
+  target: string
+  text: string
+  version: string
 }
 
 /** 一个规范根目录（`source` 决定它的分组；`skipSystem` 与官方一致）。 */
@@ -654,6 +700,142 @@ export function apply(ctx: HostContext): void {
       return out
     }
 
+    // ── 写入面：启用 / 关闭一个 skill ─────────────────────────────────────────
+    //
+    // 这个开关的语义**完全是官方的**：`dsh-skill-filesystem` 的 frontmatter 支持
+    // `disable-model-invocation` 与 `user-invocable` 两个键（README「Skill format」），
+    // 前者把 skill 从模型目录与加载器里拿走，后者把人手输入 `/名字` 的入口拿走。
+    // 所以本插件不需要发明状态：读它们的当前值当开关状态，写它们当开关动作。
+    //
+    // 生效不需要重启：provider 自己 watch 每个根，`SKILL.md` 一改就 invalidate，
+    // 模型下一步拿到的是替换后的目录。
+
+    /**
+     * 只改调用策略两行的重写器。
+     *
+     * 逐字节重建头部、正文原样拼回：**绝不整文件重排**（用户的 frontmatter 可能用了
+     * 块标量、引号、注释，重排一次就把它们写没了）。
+     * @param raw - 当前文件全文。
+     * @param enabled - true = 删掉两个键（官方默认两者皆允许）；false = 写入停用取值。
+     * @returns 新全文。内容没变时与 `raw` **逐字节相同**（调用方据此判"无变化"）。
+     */
+    const rewriteInvocation = (raw: string, enabled: boolean): string => {
+      const eol = raw.includes('\r\n') ? '\r\n' : '\n'
+      const firstLineEnd = raw.indexOf('\n')
+      if (firstLineEnd < 0 || raw.slice(0, firstLineEnd).replace(/\r$/, '') !== '---') {
+        throw new Error('这个 skill 文件没有 frontmatter，改不了停用开关')
+      }
+      let cursor = firstLineEnd + 1
+      let blockEnd = -1
+      while (cursor <= raw.length) {
+        const nextNewline = raw.indexOf('\n', cursor)
+        const lineEnd = nextNewline < 0 ? raw.length : nextNewline
+        if (raw.slice(cursor, lineEnd).replace(/\r$/, '') === '---') {
+          blockEnd = cursor
+          break
+        }
+        if (nextNewline < 0) break
+        cursor = nextNewline + 1
+      }
+      if (blockEnd < 0) throw new Error('这个 skill 文件的 frontmatter 没有闭合的 --- 行，改不了停用开关')
+
+      const lines = raw.slice(firstLineEnd + 1, blockEnd).split(eol)
+      // 片段总是以换行结尾，split 会多出一个空串——去掉它才是真正的行列表。
+      if (lines.at(-1) === '') lines.pop()
+      const kept = lines.filter((line) => !INVOCATION_KEY_LINE.test(line))
+      if (!enabled) {
+        kept.push('disable-model-invocation: true')
+        kept.push('user-invocable: false')
+      }
+      const head = raw.slice(0, firstLineEnd + 1)
+      const body = kept.length === 0 ? '' : `${kept.join(eol)}${eol}`
+      return `${head}${body}${raw.slice(blockEnd)}`
+    }
+
+    /**
+     * 打开一份文件准备写：`resolve` + `stat`（拿版本）+ `readText`。
+     *
+     * 版本是必须的：写入要用 `replaceIfVersion` 护栏，拿不到版本就说明这个后端不提供
+     * 版本号，那就**不写**（宁可报错，也不做无护栏的覆盖）。
+     * @returns 三件套，或 undefined（服务缺失 / 不是普通文件 / 没有版本 / 读不到）。
+     */
+    const openForWrite = async (path: string, signal: AbortSignal): Promise<WritableFile | undefined> => {
+      const fsService = service<FsService>('fs')
+      if (typeof fsService?.resolve !== 'function') return undefined
+      if (typeof fsService.stat !== 'function' || typeof fsService.readText !== 'function') return undefined
+      if (typeof fsService.writeText !== 'function') return undefined
+      try {
+        const target = await fsService.resolve(path, { signal })
+        const info = await fsService.stat(target, signal)
+        if (info === undefined || info.type !== 'file') return undefined
+        const version = typeof info.version === 'string' ? info.version : undefined
+        if (version === undefined) return undefined
+        const text = await fsService.readText(target, signal)
+        if (typeof text !== 'string') return undefined
+        return { target, text, version }
+      } catch {
+        return undefined
+      }
+    }
+
+    /** 带版本护栏地写回一份文件。失败一律带着原因抛出去，绝不静默。 */
+    const writeFileGuarded = async (file: WritableFile, next: string, signal: AbortSignal): Promise<void> => {
+      const fsService = service<FsService>('fs')
+      if (typeof fsService?.writeText !== 'function') throw new Error('宿主没有提供可写的文件系统服务')
+      await fsService.writeText(file.target, next, { kind: 'replaceIfVersion', version: file.version }, signal)
+    }
+
+    /**
+     * 开关一个 skill（写它的 `SKILL.md`）。
+     *
+     * 定位只用**宿主自己算出来的**规范根（`scanRoot`）——客户端只能给 `name`，
+     * 给不了路径。找不到时用注册表快照说明**为什么**不可写（随包 / 配置目录 / 刚被删），
+     * 而不是甩一句"失败"。
+     * @param options - 查询参数 + `name`。
+     * @param enabled - true = 启用（删两个键）；false = 停用（写两个键）。
+     * @param signal - 取消信号。
+     */
+    const setSkillEnabled = (options: SetEnabledOptions, enabled: boolean, signal: AbortSignal): Promise<SetEnabledResult> =>
+      withView(options, signal, async (view) => {
+        const name = String(options.name ?? '')
+        if (name === '') throw new Error('缺少 skill 名字')
+        const standard = await standardRoots(view.cwd)
+        let match: ScannedSkill | undefined
+        for (const spec of standard.specs) {
+          if (!WRITABLE_SOURCES.includes(spec.source)) continue
+          match = (await scanRoot(spec, signal)).find((row) => row.name === name)
+          if (match !== undefined) break
+        }
+        if (match === undefined) {
+          // 不可写的原因要分开说：随包/运行时没有文件；配置目录定位不到；其余是真的没了。
+          const snapshot = await view.registry.snapshot({ cwd: view.cwd, scope: view.scope, signal })
+          const known = (Array.isArray(snapshot?.skills) ? snapshot.skills : []).find((row) => String(row?.name ?? '') === name)
+          if (known === undefined) {
+            throw new Error(`当前视图里找不到 skill "${name}"；它可能刚被改名或删除，请刷新后重试`)
+          }
+          const source = typeof known.source === 'string' ? known.source : 'unknown'
+          if (source === 'custom') {
+            throw new Error(`「${name}」在 Config.customSkillDirs 指定的目录里，本页定位不到它的文件，改不了开关`)
+          }
+          throw new Error(`「${name}」是随包内置（或运行时注册）的 skill，没有可改写的文件`)
+        }
+
+        const file = await openForWrite(match.path, signal)
+        if (file === undefined) {
+          throw new Error(`读不到「${name}」的 skill 文件：它可能被移动了，或当前文件系统不让改写`)
+        }
+        const next = rewriteInvocation(file.text, enabled)
+        // 逐字节比对：开关本来就是这个状态时**不写**（写一次就多一次 mtime 变动，
+        // 也会白白触发 provider 的失效重扫）。
+        if (next === file.text) return { name, path: match.path, enabled, changed: false }
+        try {
+          await writeFileGuarded(file, next, signal)
+        } catch (error) {
+          throw new Error(`写入「${name}」失败：${error instanceof Error ? error.message : String(error)}`)
+        }
+        return { name, path: match.path, enabled, changed: true }
+      })
+
     /**
      * 解析「一次读取」所需的 `{ registry, scope, cwd, resolvedBy, presetId }`。
      *
@@ -783,6 +965,8 @@ export function apply(ctx: HostContext): void {
         provider: typeof skill?.provider === 'string' ? skill.provider : undefined,
         modelInvocable: skill?.invocation?.modelInvocable !== false,
         userInvocable: skill?.invocation?.userInvocable !== false,
+        // 能不能点那个开关：只有我们自己算得出路径、也写得进去的来源才行。
+        writable: WRITABLE_SOURCES.includes(source),
         resourceKind: typeof skill?.resourceBase?.kind === 'string' ? skill.resourceBase.kind : undefined,
       }
     }
@@ -926,13 +1110,14 @@ export function apply(ctx: HostContext): void {
           const data = await readCatalog(options, controller.signal)
           return respond(200, {
             ok: true,
-            data: { ...data, route: ROUTE, capabilities: ['snapshot', 'read'] },
+            data: { ...data, route: ROUTE, capabilities: ['snapshot', 'read', 'set-enabled'] },
           })
         }
 
         // 请求体是客户端自己发的 JSON，但**当作不可信输入**收窄：非字符串一律退回 query 里的值。
+        // 注意 `path` 一概不收——目标文件只能由宿主自己算（见 `setSkillEnabled`）。
         const payload = (await request.json()) as
-          | { op?: unknown; name?: unknown; sessionId?: unknown; cwd?: unknown }
+          | { op?: unknown; name?: unknown; enabled?: unknown; sessionId?: unknown; cwd?: unknown }
           | null
           | undefined
         switch (payload?.op) {
@@ -944,6 +1129,19 @@ export function apply(ctx: HostContext): void {
                 sessionId: typeof payload.sessionId === 'string' ? payload.sessionId : options.sessionId,
                 cwd: typeof payload.cwd === 'string' ? payload.cwd : options.cwd,
               },
+              controller.signal,
+            )
+            return respond(200, { ok: true, data })
+          }
+          case 'set-enabled': {
+            const data = await setSkillEnabled(
+              {
+                ...options,
+                name: payload.name,
+                sessionId: typeof payload.sessionId === 'string' ? payload.sessionId : options.sessionId,
+                cwd: typeof payload.cwd === 'string' ? payload.cwd : options.cwd,
+              },
+              payload.enabled !== false,
               controller.signal,
             )
             return respond(200, { ok: true, data })
