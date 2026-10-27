@@ -268,9 +268,11 @@ profile 的 `customSkillDirs` 指向 `app.asar` 内的 `<agent-preset>/skills`�
 卸载 `plugin_manager(action:'remove_bundle', target:'@qq540491950/dsh-skill-manager')`。
 宿主半边变了 → 装完**重启一次 DSH**（1.2）。
 
-**状态：尚未发布、尚未安装验证。** 本机 `npm whoami` → `ENEEDAUTH`（未登录），
-profile 本轮**没有被改动**，所以"装进 profile 后页面真的能用"这件事**未实测**。
-写文档时不许把它写成已验证。
+**状态（2026-10-27 更新）：已真装、仍未发布。** v0.2.0 已用
+`install_bundle(target: 'github:qq540491950/dsh-skill-manager#v0.2.0')` 装进 `desktop` profile
+（`application: applied`、`warnings: []`、profile 里 `0.1.0 → 0.2.0`），所以"装得上"这条**已实测**；
+但"宿主半边的新代码真的在跑"仍需重启 DSH，**页面表现未实测**。`npm publish` 仍未做
+（本机 `npm whoami` → `ENEEDAUTH`）。写文档时不许把"装完就能用"写成已验证。
 
 ### 2.13 写入面**只有一个**：`set-enabled` 改写 `SKILL.md` 的 frontmatter
 
@@ -656,7 +658,7 @@ effect 里的数据链是 `async/await` + `.then(setState)`。只 `await` 一个
 | `listTokens` 不是完整 token 表 | 它只列需要 light/dark 双份覆写的 alias 子集；判断 token 是否存在以官方 CSS 用法为准 |
 | 宿主日志基本不可看 | 要靠自检 + 渲染测试兜住，不能靠"跑起来看看" |
 | **`lib/**` 是生成物** | 源码在 `src/**`，改完必须 `npm run build`。手改 `lib/**` 会被下一次构建覆盖，且 E 区 + CI 的 `git diff --exit-code -- lib` 会红（见 2.11） |
-| **bundle 安装未实测、包未发布** | 还没装进任何 profile，也没 `npm publish`（本机 `npm whoami` → `ENEEDAUTH`）。"装完页面就能用"目前是**推断**，不是实测（见 2.12） |
+| **bundle 已装、包未发布** | 安装已实测（v0.2.0 从 git tag 装进 desktop profile），但装完的**页面表现**未实测（宿主半边要重启，见 2.12）。`npm publish` 未做。 |
 | **包图标渲染未见** | `assets/icon.svg` 只是 bundle 清单字段；座位注册字段白名单里没有 `icon`（3.4），它不进导航图标。界面里实际什么样**没看过** |
 | **上游 provider 会被一个坏根目录整条拖死** | `dsh-skill-filesystem.list()` 没有 per-root try/catch。**本插件用直读兜底（见 2.10），但那不等于上游修好了**：`customSkillDirs`（本机指向 app.asar 内的 `<agent-preset>/skills`）仍然读不出来，「自定义」分组因此仍可能是 0。修它属于 profile 配置，不归本插件。 |
 | **直读的 frontmatter 解析是子集** | 宿主半边零 import，拿不到官方的 `yaml` 包，只实现了 `key: value` / 块标量 / 引号标量。比官方严格或宽松的写法都会导致「少列」或「多列」。因此**逐条对齐官方的硬性要求**（B80），并且**宁可漏也不编**。 |

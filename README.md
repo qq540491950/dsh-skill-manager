@@ -423,14 +423,15 @@ lib  cordis.patch.yml  locale/*.json  assets/icon.svg  README.md  LICENSE
   `exports["./cordis.patch.yml"]`、`exports["./locale/*.json"]` 都还在
   （P 区在源码侧已钉过一遍，这里看的是**实际打出来的包**）。
 
-### 6.7 状态：未发布、未真装
+### 6.7 状态：bundle 已真装（v0.2.0），仍未 `npm publish`
 
 | 项 | 状态 |
 |---|---|
 | 包改造（字段 / patch 层 / locale / icon / LICENSE / CI） | 已完成；静态断言在 P 区 |
-| 真装进 profile | **未实测**（本轮用户明确要求不动 profile） |
-| `npm publish` | **未做**：本机 `npm whoami` → `ENEEDAUTH`（未登录） |
-| 图标在界面里的观感 | **未见**：v0.1.0 的 `icon` 只进 bundle 清单，座位注册不吃它 |
+| 真装进 profile | **已实测（2026-10-27）**：`install_bundle` 装 `github:qq540491950/dsh-skill-manager#v0.2.0` → `application: applied`、`warnings: []`，profile 里 `0.1.0 → 0.2.0`。当时用户是 v0.1.0（github 路线）在用，页面可见 |
+| 装完之后的**页面表现** | **仍未实测**：`src/host/**` 变了，要重启 DSH 才生效（`application: applied` 只说明 Loader 认了这一次安装，不等于宿主半边已在跑新代码） |
+| `npm publish` | **未做**：本机 `npm whoami` → `ENEEDAUTH`（未登录）。安装走的是 git tag，不是注册表 |
+| 图标在界面里的观感 | **未见**：`icon` 只进 bundle 清单，座位注册不吃它 |
 
 所以 §7.2 的"未实测"清单照旧有效。**不要因为包里有了这些字段就写成"已发布"。**
 
@@ -461,7 +462,9 @@ lib  cordis.patch.yml  locale/*.json  assets/icon.svg  README.md  LICENSE
 | 本插件自身：`npm run check` 全绿（typecheck + build + verify **PASS 333/333**），含 **A0**（package.json 解析失败不许崩）、**E 区**（产物契约 / 构建新鲜度 / banner）、**P 区**（发布形态）与本轮新增的写入面断言（A14 / A34–A36、B100–B120、D70–D82） | `npm run check` 的实际输出 |
 | **2026-10-27 本轮反向验证 13/13**：A0 / P1 / P2 / P3 / P4 / P8 / P9 / P11 / P14 / E2 / E3 / E5 / P15 逐条按预期报出断言 id，且注入文件全部逐字节还原 | 记录见 `AGENTS.md` 4.4（含本轮新踩到的两个坑） |
 | `npm pack --dry-run` 实际打出 **15 个文件**：`lib/index.js`、`lib/client.js`、`lib/types/**`（5 个 `.d.ts`）、`lib/.build-manifest.json`、`cordis.patch.yml`、`locale/{en,zh}.json`、`assets/icon.svg`、`README.md`、`LICENSE`、`package.json`；包内**没有** `src/`、`tools/`、`node_modules/`、`.tsbuildinfo`、`*.tgz` | `npm pack --dry-run` 的实际输出（40.3 kB tarball / 111.1 kB unpacked） |
-| 历史那一轮 **11/11 反向验证**逐条精确报错（直读兜底 + 诊断下线那一版代码） | 该轮脚本输出（旧骨架，已被本轮 13/13 取代） |
+| **2026-10-27 本轮反向验证 12/12**：A34 / A14 / A15 / A35 / A36 / B105 / B120 / D73 / D72 / D76 / D78 / D80 逐条按预期报出断言 id，注入文件全部逐字节还原 | 脚本输出（`tools/.tmp/reverse.mjs`，跑完即删）；明细见 `AGENTS.md` 4.3 |
+| **bundle 升级装得上**：`install_bundle('github:qq540491950/dsh-skill-manager#v0.2.0')` → `application: applied`、`warnings: []`，profile `0.1.0 → 0.2.0` | `plugin_manager` 的实际返回 + profile `package.json` |
+| 历史那一轮 **11/11 反向验证**逐条精确报错（直读兜底 + 诊断下线那一版代码） | 该轮脚本输出（旧骨架，已被 13/13 与 12/12 取代） |
 
 ### 7.1.1 上游问题：`customSkillDirs` 指向 app.asar（**不是本插件的 bug**）
 
@@ -556,7 +559,7 @@ skill 读回来。（`自定义` 那一格仍受上游影响，因为它指向�
 | **preset 自带 skill 能否恢复** | 取决于上游 `customSkillDirs` 的修复（见 7.1.1） | 修好 profile 后「自定义」分组会出现内容 |
 | **深浅两套主题下的实际观感** | 主题切换未测 | 切换主题看一遍 |
 | `B52` 截断边界之外的超大正文 | 只测了 200010 字符一例 | 可选 |
-| **bundle 真装进 profile** | 本轮用户明确要求不动 profile，所以一次都没装过；"装完页面就能用"目前是**推断** | 按 §6.3 备份 profile → `install_bundle`（本地路径）→ 查座位只有一格 → 再删手写行 |
+| **bundle 真装进 profile** | 2026-10-27 已实测一次：`install_bundle('github:…#v0.2.0')` → `application: applied`、`warnings: []`、profile 里 0.1.0 → 0.2.0（见 §6.7）。**但装完的页面表现仍未实测**——宿主半边要重启 DSH 才会跑新代码 | 重启一次 DSH，看 设置 → Skills 里每行是否多出开关，再点一次项目 skill 的开关 |
 | **`npm publish` / 按 registry 名再装一次** | 本机 `npm whoami` → `ENEEDAUTH`，没有登录 | 登录后 `npm publish --access public`，再 `install_bundle` 包名复验 |
 | **`npm pack` 的实际内容** | 没跑（清单见 §6.6） | `npm pack` + 解包逐项对照 §6.6 |
 | **包图标在界面里的渲染** | 没看过：`icon` 只进 bundle 清单，座位注册字段里没有它 | 装好后看插件列表/卡片里的图标 |
@@ -579,7 +582,7 @@ skill 读回来。（`自定义` 那一格仍受上游影响，因为它指向�
 | 客户端半边会热重载 | 改 `src/client/**` 同样**先要 `npm run build`**；之后**只在 `pnpm run dev:web` 也在跑**时，client-plugin 变更才会免刷新生效；否则要刷新页面。 |
 | **`lib/**` 是生成物** | 源码在 `src/**`。手改 `lib/**` 会被下一次 `npm run build` 覆盖，且 E 区的指纹断言与 CI 的 `git diff --exit-code -- lib` 都会红。 |
 | **手写行与 bundle 安装同 id 冲突** | 两条同 id 条目**不报错**，后插入者赢——表现是"装完看着毫无变化"。迁移顺序见 §6.3。 |
-| **bundle 未真装、包未发布** | 见 §6.7：没装进任何 profile，也没 `npm publish`。所有"装完就能用"的说法目前都是**推断**。 |
+| **bundle 安装未实测、包未发布** | 见 §6.7：**安装已实测**（v0.2.0 经 `install_bundle` 从 git tag 装进 desktop profile，`application: applied`），但"装完页面长什么样"仍未实测——宿主半边要重启。`npm publish` 仍未做（本机 `npm whoami` → `ENEEDAUTH`）。 |
 | `order` 不保证"永远最后" | 910 只是大于 MCP 的 900。别的插件开更大就会排到后面。 |
 | 同 `(id, priority)` 冲突会抛错 | `id` 的唯一性约束在 `(id, priority)`；`order` 可以重复。所以 `id: "skills"` 不能与别的插件重名。 |
 | 无 session 时没有权威 cwd | 宿主没有「当前工作区」概念。此时 `cwd: undefined`，项目类 skill 可能少列——`resolvedBy` 会如实说明。 |
