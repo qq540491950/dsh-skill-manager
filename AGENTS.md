@@ -273,7 +273,7 @@ profile 的 `customSkillDirs` 指向 `app.asar` 内的 `<agent-preset>/skills`�
 
 **状态（2026-10-27 更新）：已真装、仍未发布。** v0.2.0 已用
 `install_bundle(target: 'github:qq540491950/dsh-skill-manager#v0.2.0')` 装进 `desktop` profile
-（`application: applied`、`warnings: []`、profile 里 `0.1.0 → 0.2.0`），所以"装得上"这条**已实测**；
+（`application: applied`、`warnings: []`、profile 里 `0.1.0 → 0.2.0`）；v0.3.0 也已用同一路线升级装上（`#v0.3.0` → `application: applied`、`warnings: []`、profile 依赖 `0.2.1 → 0.3.0`），所以"装得上"这条**已实测**；
 但"宿主半边的新代码真的在跑"仍需重启 DSH，**页面表现未实测**。`npm publish` 仍未做
 （本机 `npm whoami` → `ENEEDAUTH`）。写文档时不许把"装完就能用"写成已验证。
 

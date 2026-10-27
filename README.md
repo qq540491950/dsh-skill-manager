@@ -489,6 +489,7 @@ lib  cordis.patch.yml  locale/*.json  assets/icon.svg  README.md  LICENSE
 |---|---|
 | 包改造（字段 / patch 层 / locale / icon / LICENSE / CI） | 已完成；静态断言在 P 区 |
 | 真装进 profile | **已实测（2026-10-27）**：`install_bundle` 装 `github:qq540491950/dsh-skill-manager#v0.2.0` → `application: applied`、`warnings: []`，profile 里 `0.1.0 → 0.2.0`。当时用户是 v0.1.0（github 路线）在用，页面可见 |
+| 升级装进 profile（v0.3.0） | **已实测（2026-10-27）**：`install_bundle(target: 'github:qq540491950/dsh-skill-manager#v0.3.0')` → `application: applied`、`warnings: []`，profile 依赖 `0.2.1 → 0.3.0`（pnpm 输出 `+ 0.3.0`）。**装完的页面表现仍未实测**：宿主半边变了，要重启 DSH |
 | 装完之后的**页面表现** | **仍未实测**：`src/host/**` 变了，要重启 DSH 才生效（`application: applied` 只说明 Loader 认了这一次安装，不等于宿主半边已在跑新代码） |
 | `npm publish` | **未做**：本机 `npm whoami` → `ENEEDAUTH`（未登录）。安装走的是 git tag，不是注册表 |
 | 图标在界面里的观感 | **未见**：`icon` 只进 bundle 清单，座位注册不吃它 |
