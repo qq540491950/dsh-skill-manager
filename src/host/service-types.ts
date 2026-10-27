@@ -86,11 +86,14 @@ export interface FsEntry {
   target?: { displayPath?: unknown } | undefined
 }
 
-/** 写入意图：本插件只用 `replaceIfVersion`（无护栏的覆盖一律不做）。 */
-export interface FsWriteIntent {
-  kind: 'replaceIfVersion'
-  version: string
-}
+/**
+ * 写入意图。
+ *
+ * 两种都**带护栏**，绝不无护栏覆盖：
+ *  - `replaceIfVersion`：改一个已存在的文件（`SKILL.md`、已存在的账本），版本对不上就拒写；
+ *  - `createIfAbsent`：只创建不覆盖（账本第一次落地时用；文件已存在时后端会拒）。
+ */
+export type FsWriteIntent = { kind: 'replaceIfVersion'; version: string } | { kind: 'createIfAbsent' }
 
 /**
  * 一次写入的沙箱策略。

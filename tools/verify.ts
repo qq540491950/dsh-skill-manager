@@ -182,6 +182,8 @@ interface HostFixture {
   files?: Record<string, string>
   unresolvable?: string[]
   noFs?: boolean
+  /** `ctx.fs` 没有 `stat`（读不到版本号 → 既写不了 SKILL.md，也读不出账本）。 */
+  noStat?: boolean
   noSandboxPolicy?: boolean
   fsThrows?: boolean
 }
@@ -425,11 +427,25 @@ for (const [id, needle] of [
 ]) {
   check(id, !hostCode.includes(needle), `lib/index.js 含写入 API "${needle}"，本插件只允许改写 SKILL.md 的 frontmatter`)
 }
-// 唯一写入点：整个产物里只有一处 `writeText(` **调用**（类型探测不算）。
+// 写入点：全产物里只有**两处** `writeText(` **调用**（类型探测不算）。
+//
+// 为什么从 1 处变成 2 处（本轮契约变更）：开关拆成两条正交的轴之后，多了一处**账本**
+// 写入（`$DSH_HOME/.skill-manager-state.json`，记录"谁关的"与"被删掉的原行"）。
+// 它不是放开写入面，而是**同样的收窄**：
+//   - `writeSkillFile` —— 唯一能改 `SKILL.md` 的地方（`replaceIfVersion` 护栏）；
+//   - `writeStateFile` —— 唯一能改账本的地方（不存在 `createIfAbsent`，存在 `replaceIfVersion`）；
+// 两处都必须显式带 `writePolicy()`。别的地方再出现 `writeText(` 就是没走这两条路，立刻红。
 const writeCalls = [...hostCode.matchAll(/\.writeText\s*\(/g)].length
-check('A14', writeCalls === 1, `writeText 调用点 ${writeCalls} 处，期望 1（多一处就是没走同一条写入路径）`)
-// 版本护栏：每次写都是 `replaceIfVersion`，绝不做无护栏覆盖。
+check('A14', writeCalls === 2, `writeText 调用点 ${writeCalls} 处，期望 2（一处写 SKILL.md、一处写账本；多一处就是没走这两条写入路径）`)
+// 两条写入路径必须**各自存在**，且各自带护栏。名字是硬编码的锚点：产物 `minify: false`，
+// 函数名不会被改写，所以这条能精确指出"是哪一个写入点没了护栏"。
+for (const fn of ['writeSkillFile', 'writeStateFile']) {
+  const body = new RegExp(`(?:const|let|var)\\s+${fn}\\s*=`, 'g')
+  check(`A14[${fn}]`, body.test(hostCode), `产物里找不到写入函数 ${fn}（写入路径被改名/绕过，护栏就没法定位）`)
+}
+// 版本护栏：两次写都必须是带护栏的意图，绝不做无护栏覆盖。
 check('A34', hostCode.includes('replaceIfVersion'), '写入没有带 { kind: "replaceIfVersion" } 版本护栏')
+check('A34b', hostCode.includes('createIfAbsent'), '账本首次落地必须用 { kind: "createIfAbsent" } 护栏（不许无护栏新建）')
 // **没有删除**：ctx.fs 的契约里没有 unlink/rmdir，真删只能起 shell 进程（会绕过沙箱围栏）。
 check(
   'A35',
@@ -1030,13 +1046,19 @@ function makeHost(options: HostFixture = {}): HostFixtureHandle {
               target: { targetKey: `${target.displayPath}/${entry.name}`, displayPath: `${target.displayPath}/${entry.name}` },
             }))
           },
-          async stat(target: FsTarget) {
-            calls.stat.push(target.displayPath)
-            const text = files[target.displayPath]
-            // 版本号是写入护栏的凭证：真后端（fs-local / fs-sandbox）总是给一个，
-            // 这里按内容派生，改完之后版本自然不同。
-            return text === undefined ? undefined : { type: 'file', version: `v:${text.length}` }
-          },
+          // `noStat` 时这个成员整个缺席：账本与 SKILL.md 都拿不到版本号 →
+          // 账本判"不可用"、写入判"不收"。用来验「缺能力 ≠ 空账本」。
+          ...(options.noStat === true
+            ? {}
+            : {
+                async stat(target: FsTarget) {
+                  calls.stat.push(target.displayPath)
+                  const text = files[target.displayPath]
+                  // 版本号是写入护栏的凭证：真后端（fs-local / fs-sandbox）总是给一个，
+                  // 这里按内容派生，改完之后版本自然不同。
+                  return text === undefined ? undefined : { type: 'file', version: `v:${text.length}` }
+                },
+              }),
           async readText(target: FsTarget) {
             calls.readText.push(target.displayPath)
             const text = files[target.displayPath]
@@ -1491,17 +1513,26 @@ const readGonePost: any = await withEnv({ DSH_AGENTS_HOME: 'C:/agents' }, async 
 })
 check('B96', readGonePost.status === 409, `文件不在的 skill 应 409，实际 ${readGonePost.status}`)
 
-// ── 启用 / 关闭开关：本插件**唯一**的写入面 ────────────────────────────────
+// ── 两条**正交**的调用轴 + 一本账：本插件**唯一**的两处写入面 ────────────────
 //
 // 语义完全是官方的：`disable-model-invocation: true` 把 skill 从模型目录与加载器里拿走，
-// `user-invocable: false` 把人手 `/名字` 的入口拿走。开关就是读/写这两行。
+// `user-invocable: false` 把人手 `/名字` 的入口拿走。**两条轴各读写各的**——旧的"一个总开关"
+// 会同时动两个键，于是只关了一个轴的 skill 显示成"整体关"，而"打开"又抹平了作者的声明。
 //
-// 这里钉四件事：① 只改那两行，其余字节原样保留（关→开能逐字节还原）；
-// ② 每次写都带版本护栏；③ 不可写的来源如实拒绝且**不写**；④ 客户端给的路径一概不理。
+// 这里钉六件事：
+//   ① 关一条轴只写那一行（另一轴的键一个字节都不出现）；
+//   ② 开一条轴只删那一行；两轴都开 → 与原始文件**逐字节**相同；
+//   ③ 每次写都带护栏（`SKILL.md` 用 `replaceIfVersion`；账本首次 `createIfAbsent`、之后
+//      `replaceIfVersion`），两处都显式带 `danger-full-access` 的 per-call 策略；
+//   ④ 开的时候把删掉的原行**逐字**备份进账本 →「还原」能把原行原样写回并清掉记录；
+//   ⑤ 来源标注逐轴独立：`user`（本插件关的）/ `author`（作者原本就关）/ `unknown`（账本读不出来）；
+//   ⑥ 账本读不出来时**不猜**成 author，功能照常可用（文件才是真相）。
 const TOGGLE_MD = (extra = ''): string =>
   `---\nname: git-commit\ndescription: 提交代码\ntitle: 保留我\n${extra}---\n\n正文要原样保留\n`
 const TOGGLE_FILE = `${PROJECT_AGENTS_ROOT}/git-commit/SKILL.md`
 const TOGGLE_ENV = { DSH_HOME: 'C:/dsh', DSH_AGENTS_HOME: 'C:/agents' }
+/** 账本路径：`$DSH_HOME/.skill-manager-state.json`（`TOGGLE_ENV` 把 DSH_HOME 钉成 C:/dsh）。 */
+const STATE_FILE = 'C:/dsh/.skill-manager-state.json'
 
 const makeToggleHost = (fixture: { skills?: SkillFixture[]; files?: Record<string, string> } = {}): HostFixtureHandle => {
   const host = makeHost({
@@ -1529,41 +1560,60 @@ const togglePost = (host: HostFixtureHandle, payload: unknown): Promise<{ status
     return { status: response.status, body: await response.json() }
   })
 
-// —— 关：写入两个键，其余字节原样 ——
-const offHost = makeToggleHost()
-const offResult = await togglePost(offHost, { op: 'set-enabled', name: 'git-commit', enabled: false, sessionId: 'session-live', cwd: PROJECT_ROOT })
-check('B100', offResult.status === 200 && offResult.body.ok === true, `停用失败：${JSON.stringify(offResult.body).slice(0, 240)}`)
+/** GET 也必须在同一套 env 下跑，否则账本路径会落到另一个 `DSH_HOME`（来源就永远读不出来）。 */
+const toggleGet = (host: HostFixtureHandle): Promise<{ status: number; body: any }> =>
+  withEnv(TOGGLE_ENV, () => getJson(host, `?sessionId=session-live&cwd=${encodeURIComponent(PROJECT_ROOT)}`))
+
+/** 写 `SKILL.md` 的那些调用（账本写入不算——两者的护栏规则不同，要分开数）。 */
+const skillWrites = (host: HostFixtureHandle): Array<{ target: string; content: string; expected?: unknown; policy?: unknown }> =>
+  host.calls.write.filter((call) => call.target !== STATE_FILE)
+/** 写账本的那些调用。 */
+const stateWrites = (host: HostFixtureHandle): Array<{ target: string; content: string; expected?: unknown; policy?: unknown }> =>
+  host.calls.write.filter((call) => call.target === STATE_FILE)
+
+/** 取某一行（GET 结果里按名字）。 */
+const rowOf = (result: { body: any }, name: string): any =>
+  (Array.isArray(result.body?.data?.skills) ? result.body.data.skills : []).find((row: any) => row?.name === name)
+
+// —— 关「模型」：只写 disable-model-invocation: true，**不许**顺手动 user-invocable ——
+const modelOffHost = makeToggleHost()
+const modelOff = await togglePost(modelOffHost, { op: 'set-invocation', name: 'git-commit', axis: 'model', enabled: false, sessionId: 'session-live', cwd: PROJECT_ROOT })
+check('B100', modelOff.status === 200 && modelOff.body.ok === true, `关「模型」失败：${JSON.stringify(modelOff.body).slice(0, 240)}`)
 check(
   'B101',
-  offResult.body.data?.changed === true && offResult.body.data?.enabled === false,
-  `返回的 changed/enabled = ${JSON.stringify(offResult.body.data)}，期望 true / false`,
+  modelOff.body.data?.changed === true && modelOff.body.data?.enabled === false && modelOff.body.data?.axis === 'model',
+  `返回的 changed/enabled/axis = ${JSON.stringify(modelOff.body.data)}，期望 true / false / "model"`,
 )
-check('B102', offHost.calls.write.length === 1, `停用写了 ${offHost.calls.write.length} 次，期望 1`)
-check('B103', offHost.calls.write[0]?.target === TOGGLE_FILE, `写到了 ${JSON.stringify(offHost.calls.write[0]?.target)}，应是宿主自己算出来的那个文件`)
-const offContent = String(offHost.calls.write[0]?.content ?? '')
+check(
+  'B102',
+  skillWrites(modelOffHost).length === 1 && stateWrites(modelOffHost).length === 1,
+  `SKILL.md 写了 ${skillWrites(modelOffHost).length} 次、账本写了 ${stateWrites(modelOffHost).length} 次，各期望 1`,
+)
+check('B103', skillWrites(modelOffHost)[0]?.target === TOGGLE_FILE, `写到了 ${JSON.stringify(skillWrites(modelOffHost)[0]?.target)}，应是宿主自己算出来的那个文件`)
+const modelOffContent = String(skillWrites(modelOffHost)[0]?.content ?? '')
 check(
   'B104',
-  offContent.includes('disable-model-invocation: true') && offContent.includes('user-invocable: false'),
-  `停用后 frontmatter 少了两个键：${JSON.stringify(offContent.slice(0, 160))}`,
+  modelOffContent.includes('disable-model-invocation: true') && !modelOffContent.includes('user-invocable'),
+  `关「模型」只该写那一行（不许碰 /命令 那个键）：${JSON.stringify(modelOffContent.slice(0, 200))}`,
 )
 check(
   'B105',
-  offContent.includes('title: 保留我') && offContent.includes('正文要原样保留') && offContent.includes('description: 提交代码'),
-  `停用只该碰那两行，其余字节必须原样：${JSON.stringify(offContent.slice(0, 200))}`,
+  modelOffContent.includes('title: 保留我') && modelOffContent.includes('正文要原样保留') && modelOffContent.includes('description: 提交代码'),
+  `开关只该碰那一行，其余字节必须原样：${JSON.stringify(modelOffContent.slice(0, 200))}`,
 )
 // 版本护栏：写一次就要一个 replaceIfVersion 凭证（无护栏覆盖一律不做）。
-const guard = offHost.calls.write[0]?.expected as { kind?: unknown; version?: unknown } | undefined
+const guard = skillWrites(modelOffHost)[0]?.expected as { kind?: unknown; version?: unknown } | undefined
 check(
   'B106',
   guard?.kind === 'replaceIfVersion' && typeof guard.version === 'string',
-  `写入的护栏 = ${JSON.stringify(offHost.calls.write[0]?.expected)}，期望 { kind: "replaceIfVersion", version: "…" }`,
+  `写入的护栏 = ${JSON.stringify(skillWrites(modelOffHost)[0]?.expected)}，期望 { kind: "replaceIfVersion", version: "…" }`,
 )
 
 // **沙箱**：写入必须显式带 per-call 策略，且 mode 覆盖成 danger-full-access。
 // 省略第 5 个参数时 `fs-sandbox` 走 agentless 兜底 = 部署默认（本机 workspace-write），
 // 于是 `~/.dsh/skills/*` 这类工作区之外的 skill 一律被拒——用户实测原文：
 //   cannot write "C:\Users\admin\.dsh\skills\to-tickets\SKILL.md": file access denied under workspace-write mode
-const writePolicySent = offHost.calls.write[0]?.policy as { mode?: unknown; workspaceRoot?: unknown } | undefined
+const writePolicySent = skillWrites(modelOffHost)[0]?.policy as { mode?: unknown; workspaceRoot?: unknown } | undefined
 check(
   'B121',
   writePolicySent?.mode === 'danger-full-access',
@@ -1575,32 +1625,186 @@ check(
   `workspaceRoot 应取自 sandboxPolicy.resolve()，实际 ${JSON.stringify(writePolicySent?.workspaceRoot)}`,
 )
 
-// —— 幂等：已经是停用状态时**不写** ——
-const offAgain = await togglePost(offHost, { op: 'set-enabled', name: 'git-commit', enabled: false, sessionId: 'session-live', cwd: PROJECT_ROOT })
+// —— 幂等：这一轴本来就是该状态时**不写**（文件与账本都不写）——
+const modelOffAgain = await togglePost(modelOffHost, { op: 'set-invocation', name: 'git-commit', axis: 'model', enabled: false, sessionId: 'session-live', cwd: PROJECT_ROOT })
 check(
   'B107',
-  offAgain.body.data?.changed === false && offHost.calls.write.length === 1,
-  `重复停用应当 changed:false 且不写文件，实际 ${JSON.stringify(offAgain.body.data)} / 写入 ${offHost.calls.write.length} 次`,
+  modelOffAgain.body.data?.changed === false && skillWrites(modelOffHost).length === 1 && stateWrites(modelOffHost).length === 1,
+  `重复关同一条轴应当 changed:false 且不写任何文件，实际 ${JSON.stringify(modelOffAgain.body.data)} / SKILL.md ${skillWrites(modelOffHost).length} 次 / 账本 ${stateWrites(modelOffHost).length} 次`,
 )
 
-// —— 开：删掉两个键，逐字节回到原样 ——
-const onAgain = await togglePost(offHost, { op: 'set-enabled', name: 'git-commit', enabled: true, sessionId: 'session-live', cwd: PROJECT_ROOT })
-check('B108', onAgain.body.data?.changed === true && onAgain.body.data?.enabled === true, `重新启用失败：${JSON.stringify(onAgain.body.data)}`)
+// —— 关「/命令」：只写 user-invocable: false ——
+const userOffHost = makeToggleHost()
+const userOff = await togglePost(userOffHost, { op: 'set-invocation', name: 'git-commit', axis: 'user', enabled: false, sessionId: 'session-live', cwd: PROJECT_ROOT })
+check(
+  'B130',
+  userOff.status === 200 && userOff.body.data?.axis === 'user' && userOff.body.data?.enabled === false && userOff.body.data?.changed === true,
+  `关「/命令」失败：${JSON.stringify(userOff.body).slice(0, 240)}`,
+)
+const userOffContent = String(skillWrites(userOffHost)[0]?.content ?? '')
+check(
+  'B131',
+  userOffContent.includes('user-invocable: false') && !userOffContent.includes('disable-model-invocation'),
+  `关「/命令」只该写那一行（不许碰 模型 那个键）：${JSON.stringify(userOffContent.slice(0, 200))}`,
+)
+
+// —— 一条完整的生活史：关→关→开→开（逐字节回到原文件）+ 原行进账本 ——
+const historyHost = makeToggleHost()
+const axisPost = (axis: 'model' | 'user', enabled: boolean): Promise<{ status: number; body: any }> =>
+  togglePost(historyHost, { op: 'set-invocation', name: 'git-commit', axis, enabled, sessionId: 'session-live', cwd: PROJECT_ROOT })
+await axisPost('model', false)
+const userOffResult = await axisPost('user', false)
+check('B108', userOffResult.status === 200 && userOffResult.body.data?.changed === true, `第二条轴也关掉失败：${JSON.stringify(userOffResult.body).slice(0, 200)}`)
+const bothOff = String(skillWrites(historyHost)[1]?.content ?? '')
+check(
+  'B132',
+  bothOff.includes('disable-model-invocation: true') && bothOff.includes('user-invocable: false'),
+  `两条轴都关掉之后两个键都该在（且各写各的）：${JSON.stringify(bothOff.slice(0, 240))}`,
+)
+const modelOnResult = await axisPost('model', true)
+check(
+  'B133',
+  modelOnResult.body.data?.changed === true && modelOnResult.body.data?.enabled === true,
+  `重新打开「模型」失败：${JSON.stringify(modelOnResult.body.data)}`,
+)
+const afterModelOn = String(skillWrites(historyHost)[2]?.content ?? '')
+check(
+  'B134',
+  afterModelOn.includes('user-invocable: false') && !afterModelOn.includes('disable-model-invocation'),
+  `开「模型」只该删那一行（/命令 的停用不许被顺带抹掉）：${JSON.stringify(afterModelOn.slice(0, 240))}`,
+)
+await axisPost('user', true)
 check(
   'B109',
-  String(offHost.calls.write[1]?.content ?? '') === TOGGLE_MD(),
-  `启用后应与原始文件逐字节相同，实际 = ${JSON.stringify(String(offHost.calls.write[1]?.content ?? '').slice(0, 200))}`,
+  String(skillWrites(historyHost)[3]?.content ?? '') === TOGGLE_MD(),
+  `两条轴都打开后应与原始文件逐字节相同，实际 = ${JSON.stringify(String(skillWrites(historyHost)[3]?.content ?? '').slice(0, 240))}`,
 )
+
+// —— 账本：原行**逐字**备份 + 两处护栏（首次 createIfAbsent、之后 replaceIfVersion）——
+const ledgerJson: any = JSON.parse(String(stateWrites(historyHost).at(-1)?.content ?? '{}'))
+const ledgerEntry = ledgerJson?.entries?.[TOGGLE_FILE]
+check(
+  'B136',
+  ledgerEntry?.model?.enabled === true && Array.isArray(ledgerEntry?.model?.removed) && ledgerEntry.model.removed.length === 1 && ledgerEntry.model.removed[0] === 'disable-model-invocation: true',
+  `账本里 model 轴的 removed 必须逐字等于被删掉的原行，实际 = ${JSON.stringify(ledgerEntry?.model)}`,
+)
+check(
+  'B137',
+  ledgerEntry?.user?.removed?.[0] === 'user-invocable: false',
+  `账本里 user 轴的 removed 必须逐字等于被删掉的原行，实际 = ${JSON.stringify(ledgerEntry?.user)}`,
+)
+check(
+  'B138',
+  (stateWrites(historyHost)[0]?.expected as { kind?: unknown } | undefined)?.kind === 'createIfAbsent',
+  `账本第一次落地必须用 createIfAbsent，实际 = ${JSON.stringify(stateWrites(historyHost)[0]?.expected)}`,
+)
+check(
+  'B139',
+  (stateWrites(historyHost)[1]?.expected as { kind?: unknown } | undefined)?.kind === 'replaceIfVersion',
+  `账本已存在时必须用 replaceIfVersion 护栏，实际 = ${JSON.stringify(stateWrites(historyHost)[1]?.expected)}`,
+)
+check(
+  'B140',
+  (stateWrites(historyHost)[0]?.policy as { mode?: unknown } | undefined)?.mode === 'danger-full-access',
+  `账本写入也必须显式带 danger-full-access 策略（它在 $DSH_HOME 下，不吃 workspace-write），实际 = ${JSON.stringify(stateWrites(historyHost)[0]?.policy)}`,
+)
+
+// —— GET：来源与「可还原」逐轴独立 ——
+const factsAfterOn = await toggleGet(historyHost)
+const onRow = rowOf(factsAfterOn, 'git-commit')
+check('B141', onRow?.modelInvocable === true && onRow?.userInvocable === true, `两条轴都开着时状态应是 true/true，实际 ${JSON.stringify({ model: onRow?.modelInvocable, user: onRow?.userInvocable })}`)
+check('B142', onRow?.restorable?.model === true && onRow?.restorable?.user === true, `两个轴都有原行备份 → 都应可还原，实际 ${JSON.stringify(onRow?.restorable)}`)
+check('B143', onRow?.origins?.model === 'none' && onRow?.origins?.user === 'none', `开着的轴不该报来源，实际 ${JSON.stringify(onRow?.origins)}`)
+
+// —— 还原：把原行原样写回 + 清掉该轴账本记录 ——
+const restored = await togglePost(historyHost, { op: 'restore-invocation', name: 'git-commit', axis: 'model', sessionId: 'session-live', cwd: PROJECT_ROOT })
+check(
+  'B144',
+  restored.status === 200 && restored.body.data?.restored === true && restored.body.data?.axis === 'model',
+  `还原失败：${JSON.stringify(restored.body).slice(0, 240)}`,
+)
+check(
+  'B145',
+  String(skillWrites(historyHost).at(-1)?.content ?? '') === TOGGLE_MD('disable-model-invocation: true\n'),
+  `还原必须把原行**逐字**写回 frontmatter、其余字节不动，实际 = ${JSON.stringify(String(skillWrites(historyHost).at(-1)?.content ?? '').slice(0, 240))}`,
+)
+const ledgerAfterRestore: any = JSON.parse(String(stateWrites(historyHost).at(-1)?.content ?? '{}'))
+const entryAfterRestore = ledgerAfterRestore?.entries?.[TOGGLE_FILE]
+check(
+  'B148',
+  entryAfterRestore?.model === undefined && entryAfterRestore?.user !== undefined,
+  `还原之后必须清掉该轴的账本记录（另一轴不动），实际 = ${JSON.stringify(entryAfterRestore)}`,
+)
+const factsAfterRestore = await toggleGet(historyHost)
+const restoredRow = rowOf(factsAfterRestore, 'git-commit')
+check(
+  'B146',
+  restoredRow?.origins?.model === 'author' && restoredRow?.modelInvocable === false && restoredRow?.restorable?.model === false,
+  `还原后该轴应回到「作者已停用」且不再可还原，实际 ${JSON.stringify({ origin: restoredRow?.origins?.model, on: restoredRow?.modelInvocable, restorable: restoredRow?.restorable?.model })}`,
+)
+check(
+  'B147',
+  restoredRow?.origins?.user === 'none' && restoredRow?.restorable?.user === true,
+  `还原一条轴不许影响另一条轴，实际 ${JSON.stringify({ origin: restoredRow?.origins?.user, restorable: restoredRow?.restorable?.user })}`,
+)
+
+// —— 「你停用的」：本插件关过、文件仍是关 → user（与 author 分得开）——
+const mineHost = makeToggleHost()
+await togglePost(mineHost, { op: 'set-invocation', name: 'git-commit', axis: 'user', enabled: false, sessionId: 'session-live', cwd: PROJECT_ROOT })
+const mineRow = rowOf(await toggleGet(mineHost), 'git-commit')
+check(
+  'B149',
+  mineRow?.origins?.user === 'user' && mineRow?.userInvocable === false,
+  `本插件关掉的那一轴应报 user，实际 ${JSON.stringify({ origin: mineRow?.origins?.user, on: mineRow?.userInvocable })}`,
+)
+check('B150', mineRow?.origins?.model === 'none', `关 /命令 不许把模型轴也报成关，实际 ${JSON.stringify(mineRow?.origins)}`)
+
+// —— 「作者已停用」：文件自己写着停用、账本没记录 → author，且没有备份 → 不可还原 ——
+const authorHost = makeToggleHost({ files: { [TOGGLE_FILE]: TOGGLE_MD('disable-model-invocation: true\n') } })
+const authorRow = rowOf(await toggleGet(authorHost), 'git-commit')
+check(
+  'B151',
+  authorRow?.modelInvocable === false && authorRow?.origins?.model === 'author' && authorRow?.restorable?.model === false,
+  `作者原本停用的轴应报 author 且不可还原，实际 ${JSON.stringify({ on: authorRow?.modelInvocable, origin: authorRow?.origins?.model, restorable: authorRow?.restorable?.model })}`,
+)
+
+// —— 账本读不出来（解析失败）：来源 unknown（**不是** author），功能照常可用 ——
+// 这是本轮最关键的一条：账本丢了/坏了，不许假装"作者停用"。
+const brokenLedgerHost = makeToggleHost({ files: { [STATE_FILE]: '{ 这不是一份账本' } })
+const brokenOff = await togglePost(brokenLedgerHost, { op: 'set-invocation', name: 'git-commit', axis: 'model', enabled: false, sessionId: 'session-live', cwd: PROJECT_ROOT })
+check('B152', brokenOff.status === 200 && brokenOff.body.data?.changed === true, `账本读不出来时开关也必须照常可用：${JSON.stringify(brokenOff.body).slice(0, 200)}`)
+check(
+  'B153',
+  skillWrites(brokenLedgerHost).length === 1 && stateWrites(brokenLedgerHost).length === 0,
+  `账本不可用时不许写账本（更不能拿空账本覆盖别人的数据）：SKILL.md ${skillWrites(brokenLedgerHost).length} 次 / 账本 ${stateWrites(brokenLedgerHost).length} 次`,
+)
+const brokenRow = rowOf(await toggleGet(brokenLedgerHost), 'git-commit')
+check(
+  'B154',
+  brokenRow?.modelInvocable === false && brokenRow?.origins?.model === 'unknown',
+  `账本读不出来时来源必须是 unknown（不许猜成 author），实际 ${JSON.stringify({ on: brokenRow?.modelInvocable, origin: brokenRow?.origins?.model })}`,
+)
+
+// —— fs 缺能力（没有 fs 服务）：同样只能报 unknown ——
+const noFsFactsHost = makeHost({ noFs: true, skills: [skill('git-commit', 'project-agents', { modelInvocable: false, userInvocable: true })] })
+hostModule.apply(noFsFactsHost.ctx)
+const noFsRow = rowOf(await toggleGet(noFsFactsHost), 'git-commit')
+check(
+  'B155',
+  noFsRow?.origins?.model === 'unknown',
+  `fs 缺能力时来源必须是 unknown（不许猜成 author），实际 ${JSON.stringify(noFsRow?.origins)}`,
+)
+check('B156', noFsRow?.origins?.user === 'none', `fs 缺能力不该影响"开着的那一轴不报来源"，实际 ${JSON.stringify(noFsRow?.origins)}`)
 
 // —— 不可写的来源：如实拒绝，且**一个字节都不写** ——
 const bundledHost = makeToggleHost({ skills: [skill('office-docx', 'bundled')] })
-const bundledOff = await togglePost(bundledHost, { op: 'set-enabled', name: 'office-docx', enabled: false, sessionId: 'session-live', cwd: PROJECT_ROOT })
+const bundledOff = await togglePost(bundledHost, { op: 'set-invocation', name: 'office-docx', axis: 'model', enabled: false, sessionId: 'session-live', cwd: PROJECT_ROOT })
 check('B110', bundledOff.status === 409 && bundledOff.body.ok === false, `随包内置的 skill 应 409，实际 ${bundledOff.status}`)
-check('B111', bundledHost.calls.write.length === 0, '拒绝时不许写文件')
+check('B111', bundledHost.calls.write.length === 0, '拒绝时不许写任何文件（SKILL.md 与账本都不许）')
 check('B112', String(bundledOff.body.error ?? '').includes('随包内置'), `拒绝原因要说清是随包内置：${JSON.stringify(bundledOff.body.error)}`)
 
 const customHost = makeToggleHost({ skills: [skill('delta', 'custom')] })
-const customOff = await togglePost(customHost, { op: 'set-enabled', name: 'delta', enabled: false, sessionId: 'session-live', cwd: PROJECT_ROOT })
+const customOff = await togglePost(customHost, { op: 'set-invocation', name: 'delta', axis: 'user', enabled: false, sessionId: 'session-live', cwd: PROJECT_ROOT })
 check(
   'B113',
   customOff.status === 409 && String(customOff.body.error ?? '').includes('customSkillDirs'),
@@ -1609,36 +1813,61 @@ check(
 
 // —— 客户端给的 path 一概不理（只认名字 + 宿主自己算的根）——
 const evilHost = makeToggleHost()
-await togglePost(evilHost, { op: 'set-enabled', name: 'git-commit', enabled: false, path: 'C:/evil/SKILL.md', sessionId: 'session-live', cwd: PROJECT_ROOT })
+await togglePost(evilHost, { op: 'set-invocation', name: 'git-commit', axis: 'model', enabled: false, path: 'C:/evil/SKILL.md', sessionId: 'session-live', cwd: PROJECT_ROOT })
 check(
   'B114',
-  evilHost.calls.write[0]?.target === TOGGLE_FILE && evilHost.calls.write.every((call) => call.target !== 'C:/evil/SKILL.md'),
+  skillWrites(evilHost)[0]?.target === TOGGLE_FILE && evilHost.calls.write.every((call) => call.target !== 'C:/evil/SKILL.md'),
   `客户端传的 path 被采纳了：${JSON.stringify(evilHost.calls.write.map((call) => call.target))}`,
 )
 
 // —— 没有 frontmatter 的文件：拒绝，不猜 ——
 const noFrontHost = makeToggleHost()
-const noFrontOff = await togglePost(noFrontHost, { op: 'set-enabled', name: 'no-frontmatter', enabled: false, sessionId: 'session-live', cwd: PROJECT_ROOT })
+const noFrontOff = await togglePost(noFrontHost, { op: 'set-invocation', name: 'no-frontmatter', axis: 'model', enabled: false, sessionId: 'session-live', cwd: PROJECT_ROOT })
 check('B115', noFrontOff.status === 409, `没有 frontmatter 的文件应 409，实际 ${noFrontOff.status}`)
-check('B116', noFrontHost.calls.write.length === 0, '解析不出 frontmatter 时不许写文件')
+check('B116', noFrontHost.calls.write.length === 0, '解析不出 frontmatter 时不许写任何文件')
 
 // —— 找不到的名字：仍然如实 409 ——
 const toggleMissingHost = makeToggleHost()
-const toggleMissingOff = await togglePost(toggleMissingHost, { op: 'set-enabled', name: 'no-such-skill', enabled: false, sessionId: 'session-live', cwd: PROJECT_ROOT })
+const toggleMissingOff = await togglePost(toggleMissingHost, { op: 'set-invocation', name: 'no-such-skill', axis: 'model', enabled: false, sessionId: 'session-live', cwd: PROJECT_ROOT })
 check('B117', toggleMissingOff.status === 409 && toggleMissingHost.calls.write.length === 0, `未知名字应 409 且不写，实际 ${toggleMissingOff.status}`)
 
 // —— 缺 fs 写能力：拒绝而不是"假成功" ——
 const toggleNoFsHost = makeHost({ noFs: true })
 hostModule.apply(toggleNoFsHost.ctx)
-const toggleNoFsOff = await togglePost(toggleNoFsHost, { op: 'set-enabled', name: 'git-commit', enabled: false, sessionId: 'session-live', cwd: PROJECT_ROOT })
+const toggleNoFsOff = await togglePost(toggleNoFsHost, { op: 'set-invocation', name: 'git-commit', axis: 'model', enabled: false, sessionId: 'session-live', cwd: PROJECT_ROOT })
 check('B118', toggleNoFsOff.status === 409, `没有 fs 服务时应 409，实际 ${toggleNoFsOff.status}`)
+
+// —— 没有备份就没有「还原」：账本里没记录时必须如实拒绝 ——
+const restoreNothing = await togglePost(makeToggleHost(), { op: 'restore-invocation', name: 'git-commit', axis: 'model', sessionId: 'session-live', cwd: PROJECT_ROOT })
+check(
+  'B161',
+  restoreNothing.status === 409 && restoreNothing.body.ok === false,
+  `没有原行备份时「还原」应 409，实际 ${restoreNothing.status} / ${JSON.stringify(restoreNothing.body)}`,
+)
+
+// —— 请求本身不合法：未知 op / 未知 axis / 缺 enabled → 400，且零写入 ——
+const badOpHost = makeToggleHost()
+const badOp = await togglePost(badOpHost, { op: 'set-enabled', name: 'git-commit', axis: 'model', enabled: false, sessionId: 'session-live', cwd: PROJECT_ROOT })
+check('B157', badOp.status === 400 && badOp.body.ok === false, `旧的 set-enabled 已改名，未知 op 应 400，实际 ${badOp.status}`)
+const badAxis = await togglePost(badOpHost, { op: 'set-invocation', name: 'git-commit', axis: 'both', enabled: false, sessionId: 'session-live', cwd: PROJECT_ROOT })
+check('B158', badAxis.status === 400 && badOpHost.calls.write.length === 0, `未知的轴应 400 且零写入，实际 ${badAxis.status} / 写入 ${badOpHost.calls.write.length} 次`)
+const noEnabled = await togglePost(badOpHost, { op: 'set-invocation', name: 'git-commit', axis: 'model', sessionId: 'session-live', cwd: PROJECT_ROOT })
+check('B159', noEnabled.status === 400, `缺 enabled 应 400，实际 ${noEnabled.status}`)
+
+// —— capabilities 如实列出三条 op ——
+const capsBody: any = (await toggleGet(makeToggleHost())).body
+check(
+  'B160',
+  Array.isArray(capsBody?.data?.capabilities) &&
+    ['snapshot', 'read', 'set-invocation', 'restore-invocation'].every((name) => capsBody.data.capabilities.includes(name)),
+  `capabilities = ${JSON.stringify(capsBody?.data?.capabilities)}，应包含 snapshot / read / set-invocation / restore-invocation`,
+)
 
 // 目录行上必须带 writable：界面据此决定开关能不能点。
 const writableHost = makeToggleHost({ skills: [skill('office-docx', 'bundled'), skill('delta', 'custom')] })
-const writableData: any = (await getJson(writableHost, `?sessionId=session-live&cwd=${encodeURIComponent(PROJECT_ROOT)}`)).body.data
-const writableByName = Object.fromEntries((writableData.skills ?? []).map((row: any) => [row.name, row]))
+const writableByName = Object.fromEntries(((await toggleGet(writableHost)).body.data?.skills ?? []).map((row: any) => [row.name, row]))
 check('B119', writableByName['git-commit']?.writable === true, `项目 skill 的 writable = ${JSON.stringify(writableByName['git-commit']?.writable)}，期望 true`)
-// 不可写的三种来源都要如实标 false —— 界面靠它把开关置灰。
+// 不可写的三种来源都要如实标 false —— 界面靠它把两个开关都置灰。
 check(
   'B120',
   writableByName['office-docx']?.writable === false && writableByName['delta']?.writable === false,
@@ -1967,6 +2196,10 @@ interface CatalogSkill {
   userInvocable?: boolean
   writable?: boolean
   path?: string
+  /** 该轴关着时是谁关的（宿主按账本 + 文件判定）。 */
+  origins?: { model?: string; user?: string }
+  /** 账本里存着被删掉的原行 → 该轴给「还原」按钮。 */
+  restorable?: { model?: boolean; user?: boolean }
 }
 
 interface CatalogRoot {
@@ -2050,7 +2283,8 @@ check(
   sectionInstance !== undefined && sectionInstance.history.length >= 2 && sectionInstance.history.every((count) => count === sectionInstance.history[0]),
   `hook 位数在不同渲染间不一致：${JSON.stringify(sectionInstance?.history)} —— 存在条件式 hook`,
 )
-check('D13', sectionInstance?.history[0] === 12, `SkillSection 的 hook 位 = ${sectionInstance?.history[0]}，期望 12（useSessions + useWorkspaces + 6×useState + useEffect + 2×useCallback）`)
+// 本轮从 12 变 14：多了一个 `useCallback`（`patchAxisRow`，把写操作的结果并回这一行）。
+check('D13', sectionInstance?.history[0] === 14, `SkillSection 的 hook 位 = ${sectionInstance?.history[0]}，期望 14（useSessions + useWorkspaces + 7×useState + useEffect + 3×useCallback）`)
 
 // —— 展开正文 ——
 const expandFetch: FetchHandler = async (url, init) => {
@@ -2373,33 +2607,90 @@ const badgeTexts = readyRender.hosts.filter((node) => node.props?.className === 
 check('D37', badgeTexts.includes('filesystem'), `徽标文案 = ${JSON.stringify(badgeTexts)}，应显示提供方`)
 check('D38', !badgeTexts.some((text) => text === 'bundled' || text === 'project-dsh' || text === 'user-dsh'), `徽标不该重复分组名/source 名：${JSON.stringify(badgeTexts)}`)
 
-// ── 启用 / 关闭开关（本页唯一的写入入口）──────────────────────────────────
-// 语义是官方的：关 = 写 `disable-model-invocation: true` + `user-invocable: false`。
-// 这里钉的是**界面这一侧**：状态如实反映、不可写就禁用并说明、点了只发名字不发路径、
-// 且切换之后列表不被打回「读取中…」。
+// ── 两条**正交**的调用轴（本页唯一的写入入口）+ 来源 chip +「还原」──────────────
+//
+// 语义是官方的、而且两条轴**各点各的**：关 `模型` 只写 `disable-model-invocation: true`，
+// 关 `/命令` 只写 `user-invocable: false`。旧的"一个总开关"会把两个键写成同一个值，
+// 于是只关了一个轴的 skill 在页面上看起来是"整体关"。
+//
+// 这里钉的是**界面这一侧**：每行两个开关、状态各取各的轴、关着的轴要标出**是谁**关的、
+// 有备份才给「还原」、点了只发名字不发路径、且切换之后列表不被打回「读取中…」。
 const switchesOf = (render: { hosts: HostNode[] }): HostNode[] =>
   render.hosts.filter((node) => node.props?.role === 'switch')
+/** 某个 skill 的那两个开关。按 `aria-label`（`<名字>：<轴名>`）认，比按下标稳。 */
+const axisSwitchesOf = (render: { hosts: HostNode[] }, name: string): HostNode[] =>
+  switchesOf(render).filter((node) => String(node.props?.['aria-label'] ?? '').startsWith(`${name}：`))
+const axisSwitchOf = (
+  render: { hosts: HostNode[] },
+  name: string,
+  needle: '模型调用' | '斜杠命令',
+): HostNode | undefined =>
+  switchesOf(render).find((node) => {
+    const label = String(node.props?.['aria-label'] ?? '')
+    return label.startsWith(`${name}：`) && label.includes(needle)
+  })
+/** 页面上所有来源 chip 的文案。 */
+const chipsOf = (render: { hosts: HostNode[] }): string[] =>
+  render.hosts.filter((node) => node.props?.className === 'dskm-chip').map(textOf)
 
 const readySwitches = switchesOf(readyRender)
-check('D70', readySwitches.length === renderedCards.length, `开关 ${readySwitches.length} 个、卡片 ${renderedCards.length} 个，应一一对应`)
+// 每行**两个**开关：`模型` 与 `/命令`。
+check('D70', readySwitches.length === renderedCards.length * 2, `开关 ${readySwitches.length} 个、卡片 ${renderedCards.length} 个，期望每行 2 个`)
 check(
   'D71',
   readySwitches.length > 0 && readySwitches.every((node) => node.props?.['aria-checked'] === 'true'),
   `开关应如实反映"开着"：${JSON.stringify(readySwitches.map((node) => node.props?.['aria-checked']))}`,
 )
+// `aria-label` 必须同时含 **skill 名** 与 **轴名**：两条轴共用一个 label 的话，
+// 屏幕阅读器（和自动化测试）都分不清点的是哪一个。
+check(
+  'D89',
+  (['模型调用', '斜杠命令'] as const).every((needle) => {
+    const node = axisSwitchOf(readyRender, 'alpha', needle)
+    return node !== undefined && String(node.props?.['aria-label'] ?? '').includes('alpha')
+  }),
+  `两个开关的 aria-label 必须含 skill 名与轴名：${JSON.stringify(readySwitches.map((node) => node.props?.['aria-label']))}`,
+)
+// 可见的轴名也要在（只有 aria-label 不算"界面上有两个开关"）。
+check(
+  'D90',
+  readyRender.text.includes('模型') && readyRender.text.includes('/命令'),
+  `行尾两个开关要有可见的轴名（模型 / /命令），文本片段 = ${JSON.stringify(readyRender.text.slice(0, 240))}`,
+)
 
-// 已停用的那一行：开关必须是关的（不能显示成开）。
-const disabledRowRender = await renderSection(async () =>
+// 只关了一条轴的行：那一条 off、另一条 on —— **绝不许两个都 off**（旧总开关的语义）。
+const modelOnlyOffRender = await renderSection(async () =>
   catalogResponse({
     ...CATALOG,
-    skills: [{ ...CATALOG.skills[0], modelInvocable: false, userInvocable: false }],
+    skills: [{ ...CATALOG.skills[0], modelInvocable: false, userInvocable: true, origins: { model: 'author', user: 'none' } }],
     counts: { project: 1, global: 0, custom: 0, bundled: 0, other: 0 },
   }),
 )
-const disabledSwitch = switchesOf(disabledRowRender)[0]
-check('D72', disabledSwitch?.props?.['aria-checked'] === 'false', `停用的 skill 开关应显示为关，实际 ${JSON.stringify(disabledSwitch?.props?.['aria-checked'])}`)
+check(
+  'D72',
+  axisSwitchOf(modelOnlyOffRender, 'alpha', '模型调用')?.props?.['aria-checked'] === 'false' &&
+    axisSwitchOf(modelOnlyOffRender, 'alpha', '斜杠命令')?.props?.['aria-checked'] === 'true',
+  `只关「模型」的行：模型 off、/命令 on，实际 ${JSON.stringify({
+    model: axisSwitchOf(modelOnlyOffRender, 'alpha', '模型调用')?.props?.['aria-checked'],
+    user: axisSwitchOf(modelOnlyOffRender, 'alpha', '斜杠命令')?.props?.['aria-checked'],
+  })}`,
+)
+// 两条轴都关着的行：两个开关都是关的（而不是只关一个）。
+const allOffRender = await renderSection(async () =>
+  catalogResponse({
+    ...CATALOG,
+    skills: [{ ...CATALOG.skills[0], modelInvocable: false, userInvocable: false, origins: { model: 'author', user: 'author' } }],
+    counts: { project: 1, global: 0, custom: 0, bundled: 0, other: 0 },
+  }),
+)
+check(
+  'D72b',
+  axisSwitchesOf(allOffRender, 'alpha').length === 2 &&
+    axisSwitchesOf(allOffRender, 'alpha').every((node) => node.props?.['aria-checked'] === 'false'),
+  `两条轴都关的行，两个开关都该是关的，实际 ${JSON.stringify(axisSwitchesOf(allOffRender, 'alpha').map((node) => node.props?.['aria-checked']))}`,
+)
 
-// 不可写的来源：开关禁用 + 说明原因（"点了没反应"比没有开关更糟）。
+// 不可写的来源：**两个**开关都禁用 + 都说明原因（"点了没反应"比没有开关更糟）。
 const frozenRender = await renderSection(async () =>
   catalogResponse({
     ...CATALOG,
@@ -2407,24 +2698,129 @@ const frozenRender = await renderSection(async () =>
     counts: { project: 0, global: 0, custom: 0, bundled: 1, other: 0 },
   }),
 )
-const frozenSwitch = switchesOf(frozenRender)[0]
-check('D73', frozenSwitch?.props?.disabled === true, '不可写来源的开关必须禁用')
-check('D74', String(frozenSwitch?.props?.title ?? '').includes('随包内置'), `禁用时要说明原因，实际 title = ${JSON.stringify(frozenSwitch?.props?.title)}`)
+const frozenSwitches = axisSwitchesOf(frozenRender, 'alpha')
+check(
+  'D73',
+  frozenSwitches.length === 2 && frozenSwitches.every((node) => node.props?.disabled === true),
+  `不可写来源的两个开关都必须禁用，实际 ${JSON.stringify(frozenSwitches.map((node) => node.props?.disabled))}`,
+)
+check(
+  'D74',
+  frozenSwitches.every((node) => String(node.props?.title ?? '').includes('随包内置')),
+  `禁用时要说明原因，实际 title = ${JSON.stringify(frozenSwitches.map((node) => node.props?.title))}`,
+)
 
-// 点开关：发 op=set-enabled 的 POST，且**只带名字**（目标文件由宿主自己算）。
+// —— 来源 chip：三态各一例；开着的轴**不渲染** chip ——
+const chipRender = await renderSection(async () =>
+  catalogResponse({
+    ...CATALOG,
+    skills: [
+      { ...CATALOG.skills[0], name: 'mine', modelInvocable: false, userInvocable: true, origins: { model: 'user', user: 'none' } },
+      { ...CATALOG.skills[0], name: 'theirs', modelInvocable: false, userInvocable: true, origins: { model: 'author', user: 'none' } },
+      { ...CATALOG.skills[0], name: 'mystery', modelInvocable: false, userInvocable: true, origins: { model: 'unknown', user: 'none' } },
+    ],
+    counts: { project: 3, global: 0, custom: 0, bundled: 0, other: 0 },
+  }),
+)
+const chipTexts = chipsOf(chipRender)
+check(
+  'D91',
+  ['你停用的', '作者已停用', '来源未知'].every((text) => chipTexts.includes(text)),
+  `来源 chip 三态文案不对：${JSON.stringify(chipTexts)}`,
+)
+check(
+  'D92',
+  chipTexts.length === 3,
+  `开着的轴不该渲染 chip（三行各有一条轴开着 → 只该有 3 个 chip），实际 ${JSON.stringify(chipTexts)}`,
+)
+
+// —— 「还原」只在账本里真有备份时出现；点击发 restore-invocation ——
+const restoreRow = {
+  ...CATALOG.skills[0],
+  modelInvocable: true,
+  userInvocable: true,
+  origins: { model: 'none', user: 'none' },
+  restorable: { model: true, user: false },
+}
+const restoreRender = await renderSection(async (_url, init) => {
+  if (init?.method === 'POST') {
+    return {
+      status: 200,
+      json: async () => ({
+        ok: true,
+        data: {
+          name: 'alpha',
+          path: 'C:/skills/alpha/SKILL.md',
+          axis: 'model',
+          enabled: false,
+          restored: true,
+          origins: { model: 'author', user: 'none' },
+          restorable: { model: false, user: false },
+        },
+      }),
+    }
+  }
+  return catalogResponse({ ...CATALOG, skills: [restoreRow], counts: { project: 1, global: 0, custom: 0, bundled: 0, other: 0 } })
+})
+const restoreLinks = restoreRender.hosts.filter((node) => node.props?.className === 'dskm-link')
+check(
+  'D93',
+  restoreLinks.length === 1 && textOf(restoreLinks[0]) === '还原',
+  `只有 restorable 的那一条轴才给「还原」，实际 ${JSON.stringify(restoreLinks.map(textOf))}`,
+)
+patchFetch(restoreRender.fetchHandler, restoreRender.fetchCalls)
+let restoreMounted: RenderedNode = null
+try {
+  await restoreLinks[0]?.props?.onClick?.()
+  restoreMounted = (await mount(restoreRender.runtime, restoreRender.component, restoreRender.props)).view
+} finally {
+  globalSlots.fetch = REAL_FETCH
+}
+const restorePost = restoreRender.fetchCalls.find((call) => call.init?.method === 'POST')
+const restoreBody: any = restorePost === undefined ? {} : JSON.parse(String(restorePost.init?.body ?? '{}'))
+check(
+  'D94',
+  restoreBody?.op === 'restore-invocation' && restoreBody?.name === 'alpha' && restoreBody?.axis === 'model' && restoreBody?.path === undefined,
+  `「还原」的 POST 体不对（只该带名字 + 轴，不许带 path）：${JSON.stringify(restoreBody)}`,
+)
+const restoredHosts = hostsOf(restoreMounted)
+check(
+  'D95',
+  axisSwitchOf({ hosts: restoredHosts }, 'alpha', '模型调用')?.props?.['aria-checked'] === 'false',
+  '还原后该轴应显示成作者声明的状态（关）',
+)
+check(
+  'D96',
+  restoredHosts.every((node) => node.props?.className !== 'dskm-link'),
+  '还原之后账本里已经没备份了，「还原」按钮必须消失（否则点了会一直 409）',
+)
+
+// 点开关：发 op=set-invocation 的 POST，且**只带名字 + 轴**（目标文件由宿主自己算）。
 const FLIP_ERROR = '写入「alpha」失败：sandbox denied'
 const flipFetch: FetchHandler = async (_url, init) => {
   if (init?.method === 'POST') {
     return {
       status: 200,
-      json: async () => ({ ok: true, data: { name: 'alpha', path: 'C:/skills/alpha/SKILL.md', enabled: false, changed: true } }),
+      json: async () => ({
+        ok: true,
+        data: {
+          name: 'alpha',
+          path: 'C:/skills/alpha/SKILL.md',
+          axis: 'model',
+          enabled: false,
+          changed: true,
+          origins: { model: 'user', user: 'none' },
+          restorable: { model: false, user: false },
+        },
+      }),
     }
   }
   return catalogResponse(CATALOG)
 }
 const flipRender = await renderSection(flipFetch)
-const flipSwitch = switchesOf(flipRender)[0]
-check('D75', flipSwitch !== undefined, '没找到开关（点开关用例的前置）')
+// 点的是**模型**那一格的开关（不是"这一行的开关"——一行有两个）。
+const flipSwitch = axisSwitchOf(flipRender, 'alpha', '模型调用')
+check('D75', flipSwitch !== undefined, '没找到「模型」开关（点开关用例的前置）')
 patchFetch(flipRender.fetchHandler, flipRender.fetchCalls)
 let flipMounted: RenderedNode = null
 try {
@@ -2436,7 +2832,11 @@ try {
 }
 const flipPost = flipRender.fetchCalls.find((call) => call.init?.method === 'POST')
 const flipBody: any = flipPost === undefined ? {} : JSON.parse(String(flipPost.init?.body ?? '{}'))
-check('D76', flipBody?.op === 'set-enabled' && flipBody?.name === 'alpha' && flipBody?.enabled === false, `开关 POST 体不对：${JSON.stringify(flipBody)}`)
+check(
+  'D76',
+  flipBody?.op === 'set-invocation' && flipBody?.name === 'alpha' && flipBody?.axis === 'model' && flipBody?.enabled === false,
+  `开关 POST 体不对：${JSON.stringify(flipBody)}`,
+)
 check('D77', flipBody?.sessionId === 'session-1', `开关 POST 没带 sessionId：${JSON.stringify(flipBody)}`)
 check('D78', flipBody?.path === undefined, `开关 POST 里出现了 path（越权）：${JSON.stringify(flipBody)}`)
 // 切换后**不整页刷新**：列表还在，且没有回到「读取中…」。
@@ -2444,16 +2844,32 @@ const flipText = textOf(flipMounted)
 check('D79', flipText.includes('alpha') && !flipText.includes('读取中…'), `切换后列表被打回加载态：${JSON.stringify(flipText.slice(0, 160))}`)
 check(
   'D80',
-  switchesOf({ hosts: hostsOf(flipMounted) })[0]?.props?.['aria-checked'] === 'false',
-  '切换成功后开关没有变成关（本地状态没跟上，下一步会再发一次同样的请求）',
+  axisSwitchOf({ hosts: hostsOf(flipMounted) }, 'alpha', '模型调用')?.props?.['aria-checked'] === 'false',
+  '切换成功后那个开关没有变成关（本地状态没跟上，下一步会再发一次同样的请求）',
 )
+// **只 patch 该行的那一格**：另一条轴、以及别的行，都必须原封不动。
+const flippedHosts = hostsOf(flipMounted)
+check(
+  'D97',
+  axisSwitchOf({ hosts: flippedHosts }, 'alpha', '斜杠命令')?.props?.['aria-checked'] === 'true',
+  `关「模型」不该把「/命令」也关掉（两条轴共用一个状态是最常见的偷懒），实际 ${JSON.stringify(
+    axisSwitchesOf({ hosts: flippedHosts }, 'alpha').map((node) => node.props?.['aria-checked']),
+  )}`,
+)
+check(
+  'D98',
+  axisSwitchesOf({ hosts: flippedHosts }, 'gamma').every((node) => node.props?.['aria-checked'] === 'true'),
+  `点一行不许影响别的行，实际 gamma = ${JSON.stringify(axisSwitchesOf({ hosts: flippedHosts }, 'gamma').map((node) => node.props?.['aria-checked']))}`,
+)
+// 来源 chip 跟着这一次结果走（本插件关的 → 你停用的）。
+check('D99', chipsOf({ hosts: flippedHosts }).includes('你停用的'), `切换成功后 chip 应显示「你停用的」，实际 ${JSON.stringify(chipsOf({ hosts: flippedHosts }))}`)
 
 // 失败：一句话说明 + 列表照常在（同一错误只允许一个渲染点，AGENTS 3.7）。
 const failFlipRender = await renderSection(async (_url, init) => {
   if (init?.method === 'POST') return { status: 409, json: async () => ({ ok: false, error: FLIP_ERROR }) }
   return catalogResponse(CATALOG)
 })
-const failFlipSwitch = switchesOf(failFlipRender)[0]
+const failFlipSwitch = axisSwitchOf(failFlipRender, 'alpha', '模型调用')
 patchFetch(failFlipRender.fetchHandler, failFlipRender.fetchCalls)
 let failFlipMounted: RenderedNode = null
 try {

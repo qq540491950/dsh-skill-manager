@@ -1,7 +1,7 @@
 {
   "name": "@qq540491950/dsh-skill-manager",
-  "version": "0.2.1",
-  "description": "DSH 插件：在设置面板加一页「Skills」，按项目 / 全局 / 自定义 / 随包内置分组浏览 skill，并给每一行一个启用/关闭开关。",
+  "version": "0.3.0",
+  "description": "DSH 插件：在设置面板加一页「Skills」，按项目 / 全局 / 自定义 / 随包内置分组浏览 skill，给每一行两个正交的开关（模型 / /命令）、标出关着的轴是谁关的，并支持还原作者的原始声明。",
   "keywords": [
     "dsh",
     "dsh-plugin",

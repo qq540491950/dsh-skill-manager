@@ -44,25 +44,32 @@
  * 源码里的相对 `import` **只有类型**（`shared/types.ts`、`./service-types.ts`），
  * 类型擦除后产物里一行 import 都不剩（自检 A8–A10 + E2 钉这条）。
  *
- * ## 写入面：只有一个（启用/关闭开关）
+ * ## 写入面：两个正交的轴 + 一本账（都只落在设置动作这一侧）
  *
- * 本插件**只有一处写入**，就是 `op: "set-enabled"` 改一个 `SKILL.md` 的 frontmatter：
+ * 官方的两个键本来就是**两条独立通道**（`dsh-skill-filesystem` README「Skill format」）：
+ * `disable-model-invocation` 只挡模型，`user-invocable` 只挡 `/` 菜单。所以本插件的开关
+ * 也按轴读写，**互不影响**：
  *
- *   - 关 = 写入 `disable-model-invocation: true` + `user-invocable: false`
- *     （官方语义：前者让模型目录与 `skill` 工具看不到它，后者让 `/名字` 看不到它）
- *   - 开 = **删掉这两个键**（官方默认就是两者皆允许，删掉比写 `false` 更干净）
+ *   - `op: "set-invocation"` 带 `axis: 'model' | 'user'`：
+ *     关 → 只写这一轴那一行；开 → 只删这一轴那一行（别轴的键一个字节都不动）
+ *   - `op: "restore-invocation"`：把账本里备份的**原始行原文**写回去，清掉该轴记录
  *
  * 三条纪律：
- *   1. 只改这两行，**其余字节原样保留**（`rewriteInvocation` 逐字节重建头部，正文不动）
- *   2. 写入一律带版本护栏（`{ kind: 'replaceIfVersion', version }`），并把 gate
- *      放在 `ctx.fs.writeText` 上——**不用 `editText`**（它是文本匹配式编辑，
- *      同一个 `description` 可能出现在多处）
+ *   1. 只改被点的那一行，**其余字节原样保留**（`splitFrontmatter` 逐字节重建头部，正文不动），
+ *      所以「关 → 开」能逐字节回到原文件
+ *   2. 写入一律带护栏：`SKILL.md` 用 `{ kind: 'replaceIfVersion', version }`，账本不存在时用
+ *      `{ kind: 'createIfAbsent' }`、存在时用 `replaceIfVersion`，两处都显式带 `writePolicy()`。
+ *      **不用 `editText`**（文本匹配式编辑可能撞上重复的 `description`）
  *   3. **不接受客户端传来的路径**：目标文件由宿主自己按规范根目录算出来（`scanRoot`）
+ *
+ * 第二处写入是**账本**（`$DSH_HOME/.skill-manager-state.json`），它**不是真相来源**，
+ * 只回答两件文件回答不了的事：这一轴是**谁**关的、以及我们打开它时删掉的那一行原文是什么。
+ * 账本读不出来 → 该轴来源报 `'unknown'`，功能照常（不猜、不假装"作者停用"）。
  *
  * 没有 `ctx.loader.*`、没有 `ctx.configEditor.edit()`、不碰 `~/.dsh/profiles/**`、
  * 不注册任何 skill / 提供方。**也没有删除**：`ctx.fs` 的契约里根本没有 unlink/rmdir，
  * 真删只能起 shell 进程（会绕过沙箱围栏），所以这件事本插件**不做**（见 AGENTS 8）。
- * GET 仍是纯读；POST 只有 `op: "read"` 与 `op: "set-enabled"`。
+ * GET 仍是纯读；POST 只有 `read` / `set-invocation` / `restore-invocation` 三条。
  */
 import type { HostContext } from './service-types.ts';
 export declare const name = "dsh-skill-manager";

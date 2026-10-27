@@ -3,20 +3,20 @@
   "targets": [
     {
       "output": "lib/index.js",
-      "outputSha256": "b78e55875edc015431f398434de57459435d712fe7bc7195d4fea4f7c81e8926",
+      "outputSha256": "f2dcd5f4821aebabf413a3c81fff43851a772f89e3bae4caf41d28c4ad21164f",
       "inputs": {
-        "src/host/index.ts": "373f578320205b0133550b5da80e6fb28b876cdb56a44d3c1e870f1912f3fe9f",
-        "src/host/service-types.ts": "ac95eff0ac0557d9106eae2a93d6074a84575321681e71d7000bfe2118d19c6c",
-        "src/shared/types.ts": "14143f4e5323d33f9fd63c7dc00cee36acd86ee894f4f2cc5244211d9c25beab"
+        "src/host/index.ts": "a8bd891392d9f4bd35800b4514bdc738f6c960e8f719ee46a0b521c4aa7ab9c9",
+        "src/host/service-types.ts": "a5c5ebc9e8564a2cbf0164dd40f4b4c5274af1b95432fce90cc9c2e09ff74e71",
+        "src/shared/types.ts": "ec900cb5c9cfad498582e76ececcbb537769457cb9c07cf2aece74c6b79fa203"
       }
     },
     {
       "output": "lib/client.js",
-      "outputSha256": "555eb88cc19c3a21f96aeb0a652488ca7ac3197fdd5b9b02f2fe883f53e1fd5c",
+      "outputSha256": "9ee37d1ede41b70cf88925007bc9ea5efbe9438c9a2816e0ec54eb384ce5047b",
       "inputs": {
-        "src/client/index.ts": "f8d7c9b0b37229fb0cd0f841afd0ab02a8f2278899a493d11fc14f9e585901ff",
+        "src/client/index.ts": "589edd6312c0bc8e33b7a67ab635c11208b1987e7ebbd4f2d501c1dd51355f54",
         "src/client/service-types.ts": "f293e573591fa42ab102c0b5478890beb2113babf05ee390c3132c55b38272ed",
-        "src/shared/types.ts": "14143f4e5323d33f9fd63c7dc00cee36acd86ee894f4f2cc5244211d9c25beab"
+        "src/shared/types.ts": "ec900cb5c9cfad498582e76ececcbb537769457cb9c07cf2aece74c6b79fa203"
       }
     }
   ]

@@ -9,15 +9,18 @@
 ## 0. 30 秒定位
 
 **这是什么**：一个 DSH 插件，在设置面板加一页「Skills」，浏览当前会话可见的 skill，
-按来源分组（项目 / 全局 / 自定义 / 随包内置），并给每一行一个**启用 / 关闭**开关。
-**写入面只有一个**：开关改写那份 `SKILL.md` 的 frontmatter（`disable-model-invocation` /
-`user-invocable` 两键，见 2.13）。**没有删除**——`ctx.fs` 没有 unlink/rmdir/rename（见 8）。
+按来源分组（项目 / 全局 / 自定义 / 随包内置），并给每一行**两个正交的开关**
+（`模型` = `disable-model-invocation` / `/命令` = `user-invocable`），关着的轴旁边标出
+**是谁关的**（`你停用的` / `作者已停用` / `来源未知`），有备份时还能「还原」回作者的声明。
+**写入面是恰好两处**（见 2.13）：开关改写那份 `SKILL.md` 的 frontmatter，外加一本账
+（`$DSH_HOME/.skill-manager-state.json`，只用来标注来源与支持「还原」，**不是真相来源**）。
+**没有删除**——`ctx.fs` 没有 unlink/rmdir/rename（见 8）。
 
 **双半结构**（源码在 `src/**`，`lib/**` 是 `tools/build.ts` 生成的产物，见 2.11）：
 
 | 半边 | 源码 | 产物（运行时读的就是它） | 职责 |
 |---|---|---|---|
-| 宿主 | `src/host/index.ts`（+ `src/host/service-types.ts`） | `lib/index.js` | **产物零 import**。`ctx.connection.fetch.register()` 开 `/api/skill-manager`；解析作用域后读 `ctx.skills`，**并只读直读四个规范根目录**（见 2.10）；唯一的写入点是 `set-enabled`（见 2.13）。 |
+| 宿主 | `src/host/index.ts`（+ `src/host/service-types.ts`） | `lib/index.js` | **产物零 import**。`ctx.connection.fetch.register()` 开 `/api/skill-manager`；解析作用域后读 `ctx.skills`，**并只读直读四个规范根目录**（见 2.10）；写入面恰好两处：`writeSkillFile`（`SKILL.md`）与 `writeStateFile`（账本）（见 2.13）。 |
 | 客户端 | `src/client/index.ts`（+ `src/client/service-types.ts`） | `lib/client.js` | `window.__ModuleLoader__` 懒 CJS bundle（包装由构建脚本注入，`id` 取自 `package.json.name`）。注册 `settings.section`（list 座位，`order: 910`）。 |
 | 共用 | `src/shared/types.ts` | 无（只有类型，被擦除） | payload 契约：两边各写一遍必然漂。 |
 
@@ -274,39 +277,59 @@ profile 的 `customSkillDirs` 指向 `app.asar` 内的 `<agent-preset>/skills`�
 但"宿主半边的新代码真的在跑"仍需重启 DSH，**页面表现未实测**。`npm publish` 仍未做
 （本机 `npm whoami` → `ENEEDAUTH`）。写文档时不许把"装完就能用"写成已验证。
 
-### 2.13 写入面**只有一个**：`set-enabled` 改写 `SKILL.md` 的 frontmatter
+### 2.13 写入面**恰好两处**：`writeSkillFile`（`SKILL.md`）与 `writeStateFile`（账本）
 
-2026-10-27 用户要求加「启用 / 关闭」开关，插件因此不再是纯只读。规则是**收窄，不是放开**：
+2026-10-27 用户要求加「启用 / 关闭」开关，插件因此不再是纯只读；同一轮又把那个总开关
+拆成**两个正交的轴**（模型 / 命令）+ 来源标注 +「还原」，于是写入面从一处变成**两处**。
+规则是**收窄，不是放开**——两处都带护栏，别的地方一个写入点都不许有：
 
 | 允许 | 禁止 |
 |---|---|
-| `ctx.fs.writeText`（唯一调用点，A14 数"恰好 1 处"） | `ctx.configEditor.edit()`（A11）、`ctx.loader.create()/remove()`（A12/A13） |
-| 带 `{ kind: 'replaceIfVersion', version }` 的写入（A34） | 无护栏覆盖；`ctx.fs.editText`（A15）——文本匹配式编辑会撞重复片段 |
-| 只改 `disable-model-invocation` / `user-invocable` 两行 | 重排/重写 frontmatter 其它键（B105/B109 用"关→开逐字节还原"钉住） |
+| `ctx.fs.writeText` **恰好两处**（A14 数"恰好 2 处"，且必须分别落在 `writeSkillFile` / `writeStateFile` 里，A14[fn] 两条各查一个） | 第三处 `writeText` 调用点、`ctx.configEditor.edit()`（A11）、`ctx.loader.create()/remove()`（A12/A13） |
+| 带护栏：`SKILL.md` 用 `{ kind: 'replaceIfVersion', version }`；账本**不存在**用 `{ kind: 'createIfAbsent' }`、存在用 `replaceIfVersion`（A34 / A34b / B138 / B139） | 无护栏覆盖；`ctx.fs.editText`（A15）——文本匹配式编辑会撞重复片段 |
+| 只按轴增删**那一行**（`disable-model-invocation` 或 `user-invocable`，永远不动另一轴） | 重排/重写 frontmatter 其它键（B105/B109 用"关→开逐字节还原"钉住，B104/B131 钉"只碰那一行"） |
 | 目标文件由宿主按规范根自己算（`scanRoot`） | 接受客户端传来的路径（A36、B114） |
-| 不可写的来源**拒绝且零写入**（B110–B113） | 起 shell 进程 / 删除文件（A35；`ctx.fs` 根本没有 unlink/rmdir） |
+| 不可写的来源**拒绝且零写入**（B110–B113：SKILL.md 与账本都不写） | 起 shell 进程 / 删除文件（A35；`ctx.fs` 根本没有 unlink/rmdir） |
 
 几条容易抄近路的地方：
 
-- **开关语义是官方的，不要另造状态**：`disable-model-invocation: true` 让模型目录与
+- **开关语义是官方的，而且两个键是两条独立通道**：`disable-model-invocation: true` 让模型目录与
   `skill` 工具看不到它，`user-invocable: false` 让 `/名字` 看不到它（`dsh-skill-filesystem`
-  README「Skill format」）。本机 `~/.dsh/skills/ask-matt` 就写着前者，所以它出现在页面上
-  却不在模型目录里——这是**既有事实**，不是我们的约定。
-- 一个总开关（用户选定）：关 = 写两个键；开 = **删**两个键（官方默认即两者皆允许）。
-  代价：会抹平用户手写的 `user-invocable: false`（写进 README §8）。
+  README「Skill format」）。本机 `~/.dsh/skills/ask-matt` 就写着前者（还同时写了后者），所以它
+  出现在页面上却不在模型目录里——这是**既有事实**，不是我们的约定。
+- **不要再把两轴合成一个布尔**：那正是 v0.2.x 的毛病——作者只关一个轴的 skill 会显示成"整体关"，
+  而"打开"会把作者原本只关一轴的声明抹平。客户端也不许维护影子状态：开关状态只从
+  `modelInvocable` / `userInvocable` 各取各的，`origins` / `restorable` 只是**附加事实**。
+- **账本不是真相来源**：`$DSH_HOME/.skill-manager-state.json`（`DSH_HOME` 缺失时
+  `~/.dsh/.skill-manager-state.json`；父目录必定存在，**不要**指望 `writeText` 建目录）只回答两件
+  文件回答不了的事——这一轴是**谁**关的、以及我们打开它时删掉的那一行**原文**是什么。
+  - 读失败（fs 缺 `writeText`/`stat`、沙箱拒绝、JSON 解析失败、没有版本号）→ 账本"不可用"，
+    来源报 `'unknown'`。**「未判定」不许写成「作者停用」**（延续 3.8 的同一条纪律）。
+  - 账本不可用时**功能照常、但不写账本**（绝不拿空账本覆盖别人的记录，B152/B153）。
+  - `removed` 只在"打开"时写入（关的时候是空数组），还原时把它**逐字**写回并把该轴记录清掉。
+  - 把两件事记混的后果：来源标注开始撒谎（B149/B151/B154/B155 分别钉 user / author / unknown 三态）。
 - `writable` 由**来源**决定，不由"文件在不在"决定：`custom`（路径由 Config 决定，算不出来）
-  与 `bundled`/`runtime`（无文件）一律 false → 界面置灰说明原因。**点了没反应比没有开关更糟。**
+  与 `bundled`/`runtime`（无文件）一律 false → 行尾**两个**开关都置灰说明原因。
+  **点了没反应比没有开关更糟。**
 - 生效不需要重启：provider watch 每个根，写完自己 invalidate。
-- **写入必须显式带沙箱策略**（`writeText` 第 5 个参数，mode = `danger-full-access`，B121/B122）。
-  省略时 `fs-sandbox` 用 agentless 兜底 = 部署默认（本机 `workspace-write`），工作区外的
-  `~/.dsh/skills` 一律被拒（用户实测原文 `file access denied under workspace-write mode`）。
-  **不要**改成"跟随会话当前 mode"——那会让 read-only / workspace-write 会话里这个开关**永远**改不了。
+- **写入必须显式带沙箱策略**（`writeText` 第 5 个参数，mode = `danger-full-access`，B121/B122；
+  账本写入同样如此，B140）。省略时 `fs-sandbox` 用 agentless 兜底 = 部署默认
+  （本机 `workspace-write`），工作区外的 `~/.dsh/skills` 一律被拒（用户实测原文
+  `file access denied under workspace-write mode`）。**不要**改成"跟随会话当前 mode"——
+  那会让 read-only / workspace-write 会话里这个开关**永远**改不了。
 
-### 2.14 客户端开关：只改这一行，不整页刷新
+### 2.14 客户端开关：一个开关只改**这一行这一轴**
 
-`onFlip` 成功后**只 patch 那一行**的 `modelInvocable`/`userInvocable`。别改 `nonce` 触发整页
-重读——那会把列表打回「读取中…」、把展开的正文收掉（D79/D80 钉住）。失败信息走**独立**的
-`notice` 状态单独渲染一句，不把页面相位打成 failed（列表还在，只是这一下没写成）。
+`onFlip(skill, axis)` 成功后只 patch 那一行的**那一条轴**（`patchAxisRow`），连同
+`origins[axis]` / `restorable[axis]`。三件事都不许做：
+
+- **不许**改 `nonce` 触发整页重读——那会把列表打回「读取中…」、把展开的正文收掉（D79 钉住）。
+- **不许**把两条轴写成同一个值（`modelInvocable: result.enabled, userInvocable: result.enabled`
+  是 v0.2.x 的写法）；关「模型」不许让「/命令」跟着变（D97），点一行不许影响别的行（D98）。
+- **不许**在客户端维护影子状态：状态来自 payload，写操作的结果只用 `result` 里那一条轴的值。
+
+失败信息走**独立**的 `notice` 状态单独渲染一句，不把页面相位打成 failed（列表还在，
+只是这一下没写成）。（D81 用"出现次数 == 1"钉住。）
 
 ---
 
@@ -422,7 +445,7 @@ npm run check              # typecheck + build + verify，交付前跑这条
 
 | 区 | 覆盖 |
 |---|---|
-| A | 静态护栏：包清单 / 座位注册形状 / 主题与 inline 纪律 / 零 import / **写入面（唯一写点 + 版本护栏 + 不删除 + 不收客户端路径）/ 编码** |
+| A | 静态护栏：包清单 / 座位注册形状 / 主题与 inline 纪律 / 零 import / **写入面（恰好两处写点 + 各自护栏 + 不删除 + 不收客户端路径）/ 编码** |
 | B | **宿主半边行为**：假 ctx 真跑 `apply`、真发 `Request`，断言解析链、租约释放、分组、读取、**直读兜底与合并规则** |
 | C | 客户端协议：假 `window.__ModuleLoader__` 真跑 factory，断言座位注册项与 require 面 |
 | D | **真实渲染**：迷你渲染器展开函数组件（含 hook 顺序计数），覆盖就绪/空/失败/**无诊断**/展开正文 |
@@ -486,7 +509,28 @@ B54 不返回 roots / B64 未判定误报为不存在 / B68 探测出错就整�
 | 把 `providerFailures` 塞回 payload | B90 |
 | 正文读取不回退到直读 | B92–B94 |
 
-**本轮（启用/关闭开关）新增的注入面**——全部实测报出（12/12，见下）：
+**本轮（两轴独立 + 来源标注 + 可还原）新增的注入面**——全部实测报出（**11/11**，见下）：
+
+| 注入 | 报出 | 连带 |
+|---|---|---|
+| 两轴写反（`AXIS_OFF_LINE` 的模型/命令两行对调） | B104、B131 | B107/B108/B109、B132–B150 |
+| 开的时候不备份 `removed`（恒为空数组） | B136、B137 | B142、B144–B148 |
+| origin 一律报 `author`（抹平 user 分支） | B149 | — |
+| 账本不可用时报 `author`（未判定伪装成"作者停用"） | B154、B155 | — |
+| 客户端两个开关共用一个 `axis` | D72、D89 | D90/D92/D93/D97 |
+| 开关状态都取 `modelInvocable` | D72 | D97 |
+| chip 在开态也渲染 | D92 | — |
+| 账本写入不带护栏（`expected` 恒 `undefined`） | B138、B139 | A34b |
+| 还原后没清账本 | B148 | — |
+| 多出第三处 `writeText` 调用点 | A14 | — |
+| 账本写入函数被改名（护栏锚点丢失） | A14[writeStateFile] | B100–B149（连带） |
+
+> 最后两条专门验**改过形状的 A14**：它现在数"恰好 2 处"，并额外查
+> `writeSkillFile` / `writeStateFile` 这两个函数名是否还在产物里（`minify: false`，
+> 函数名不会被改写，所以锚点稳定）。改这两处时别把名字改掉，否则 A14[fn] 会红。
+
+**上一轮（启用/关闭开关）的注入面**——12/12 全部实测报出（保留作参考，
+但其中若干锚点已被本轮重构淘汰：`set-enabled`、`rewriteInvocation`、单个 `switch` 节点）：
 
 | 注入 | 报出 | 连带 |
 |---|---|---|
@@ -666,6 +710,9 @@ effect 里的数据链是 `async/await` + `.then(setState)`。只 `await` 一个
 | **包图标渲染未见** | `assets/icon.svg` 只是 bundle 清单字段；座位注册字段白名单里没有 `icon`（3.4），它不进导航图标。界面里实际什么样**没看过** |
 | **上游 provider 会被一个坏根目录整条拖死** | `dsh-skill-filesystem.list()` 没有 per-root try/catch。**本插件用直读兜底（见 2.10），但那不等于上游修好了**：`customSkillDirs`（本机指向 app.asar 内的 `<agent-preset>/skills`）仍然读不出来，「自定义」分组因此仍可能是 0。修它属于 profile 配置，不归本插件。 |
 | **直读的 frontmatter 解析是子集** | 宿主半边零 import，拿不到官方的 `yaml` 包，只实现了 `key: value` / 块标量 / 引号标量。比官方严格或宽松的写法都会导致「少列」或「多列」。因此**逐条对齐官方的硬性要求**（B80），并且**宁可漏也不编**。 |
-| 写入面只有一处（`set-enabled`） | 见 2.13。改 skill 的**生效方式**只有"改 `SKILL.md` 的 frontmatter"这一条；`custom`（Config 决定位置）/ `bundled` / `runtime` 没有可定位的文件，开关必须置灰。**不要**为了"让开关也能点"去起 shell 进程。 |
+| 写入面恰好两处（`writeSkillFile` / `writeStateFile`） | 见 2.13。改 skill 的**生效方式**只有"改 `SKILL.md` 的 frontmatter"这一条；`custom`（Config 决定位置）/ `bundled` / `runtime` 没有可定位的文件，**两个**开关都必须置灰。**不要**为了"让开关也能点"去起 shell 进程。 |
 | **不做删除** | `ctx.fs` 的契约里没有 unlink/rmdir/rename。真删要 `ctx.subprocess` 起 shell（绕过沙箱围栏），且 Windows 上 `Remove-Item` 对 junction 有递归删目标的风险——本机 `~/.dsh/skills/*` 全是 junction。页面给路径，用户自己删。A35 钉住"产物里不许出现删除/起进程的痕迹"。 |
-| 总开关会抹平手写的 `user-invocable: false` | "开" = 删两个键（官方默认两者皆允许）。若某个 skill 只想关掉 `/菜单`、保留模型自动调用，关→开之后这条意图就没了。单开关语义的**已知代价**。 |
+| **两个轴不再互相抹平** | 「打开 `模型`」只删 `disable-model-invocation` 那一行，`user-invocable: false` 原样留着（反之亦然）。作者"只想关一个轴"的声明不会再被开关顺手改掉（B104/B131/B134/B109）。 |
+| **账本只是标注，不是真相** | `$DSH_HOME/.skill-manager-state.json` 丢了/改坏了，只会让关着的轴显示成「来源未知」、「还原」按钮消失；是否生效永远看文件。别把它当状态机，也别在没有账本时假装"作者停用"（B152–B156）。 |
+| **「还原」不保证回到原来的行位置** | 账本只存被删掉的行原文（不存行号），所以还原是**追加到 frontmatter 末尾**、多行保序。「原行逐字写回」有断言（B145），「回到它原来那一行」做不到、也不承诺。 |
+| **账本 key 用宿主自己算的路径** | key = 宿主扫出来的 `SKILL.md` 绝对路径（分隔符统一成 `/`）。只存在于注册表、直读没扫到的 skill，key 只能用注册表给的 `path`——那种行万一标注不准，先看两边斜杠写法是否一致。 |
