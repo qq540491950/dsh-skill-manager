@@ -166,8 +166,8 @@ interface HostCalls {
   listDir: string[]
   stat: string[]
   readText: string[]
-  /** 每一次写入（`expected` 是护栏凭证，断言它真的是 replaceIfVersion）。 */
-  write: Array<{ target: string; content: string; expected?: unknown }>
+  /** 每一次写入（`expected` 是护栏凭证，`policy` 是 per-call 沙箱策略）。 */
+  write: Array<{ target: string; content: string; expected?: unknown; policy?: unknown }>
 }
 
 /** 搭宿主替身时可调的旋钮。 */
@@ -182,6 +182,7 @@ interface HostFixture {
   files?: Record<string, string>
   unresolvable?: string[]
   noFs?: boolean
+  noSandboxPolicy?: boolean
   fsThrows?: boolean
 }
 
@@ -1042,13 +1043,26 @@ function makeHost(options: HostFixture = {}): HostFixtureHandle {
             if (text === undefined) throw new Error(`cannot read ${target.displayPath}`)
             return text
           },
-          async writeText(target: FsTarget, content: string, expected?: unknown) {
-            calls.write.push({ target: target.displayPath, content, expected })
+          async writeText(target: FsTarget, content: string, expected?: unknown, _signal?: unknown, policy?: unknown) {
+            calls.write.push({ target: target.displayPath, content, expected, policy })
             files[target.displayPath] = content
             return { operation: 'update', version: `v:${content.length}`, before: null, after: content }
           },
         }
-  const services: Record<string, unknown> = { agentPresets: presets, agents, sessionQuery, workspaceRegistry: undefined, fs }
+  const services: Record<string, unknown> = {
+    agentPresets: presets,
+    agents,
+    sessionQuery,
+    workspaceRegistry: undefined,
+    fs,
+    // `ctx.sandboxPolicy.resolve()` 给的是**部署默认**（本机 workspace-write）与兜底根。
+    // 写入必须显式覆盖 mode，否则工作区之外的 skill 一律被 fs-sandbox 拒（B121/B122 钉这条）。
+    sandboxPolicy: options.noSandboxPolicy === true ? undefined : {
+      resolve() {
+        return { mode: 'workspace-write', workspaceRoot: 'C:/workspace' }
+      },
+    },
+  }
   const scope = {
     skills,
     get(name: string): unknown {
@@ -1543,6 +1557,22 @@ check(
   'B106',
   guard?.kind === 'replaceIfVersion' && typeof guard.version === 'string',
   `写入的护栏 = ${JSON.stringify(offHost.calls.write[0]?.expected)}，期望 { kind: "replaceIfVersion", version: "…" }`,
+)
+
+// **沙箱**：写入必须显式带 per-call 策略，且 mode 覆盖成 danger-full-access。
+// 省略第 5 个参数时 `fs-sandbox` 走 agentless 兜底 = 部署默认（本机 workspace-write），
+// 于是 `~/.dsh/skills/*` 这类工作区之外的 skill 一律被拒——用户实测原文：
+//   cannot write "C:\Users\admin\.dsh\skills\to-tickets\SKILL.md": file access denied under workspace-write mode
+const writePolicySent = offHost.calls.write[0]?.policy as { mode?: unknown; workspaceRoot?: unknown } | undefined
+check(
+  'B121',
+  writePolicySent?.mode === 'danger-full-access',
+  `写入的沙箱 mode = ${JSON.stringify(writePolicySent?.mode)}，必须显式是 danger-full-access（省略就会落到 workspace-write，工作区外的 skill 写不进去）`,
+)
+check(
+  'B122',
+  writePolicySent?.workspaceRoot === 'C:/workspace',
+  `workspaceRoot 应取自 sandboxPolicy.resolve()，实际 ${JSON.stringify(writePolicySent?.workspaceRoot)}`,
 )
 
 // —— 幂等：已经是停用状态时**不写** ——

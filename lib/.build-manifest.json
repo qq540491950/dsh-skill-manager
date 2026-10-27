@@ -3,10 +3,10 @@
   "targets": [
     {
       "output": "lib/index.js",
-      "outputSha256": "51bbb9866e3a6de021f85b4a0cc96da568035b82fb87882f87315ac6bc2f2923",
+      "outputSha256": "b78e55875edc015431f398434de57459435d712fe7bc7195d4fea4f7c81e8926",
       "inputs": {
-        "src/host/index.ts": "a19d3a18c2ac4a413ec0a079ae739ec5f629bbe37c0669ee7115cb986ed6e472",
-        "src/host/service-types.ts": "d71c984ee236f583b3e28e64e993e869780c350eca2d3d5efe50066e664c1cae",
+        "src/host/index.ts": "373f578320205b0133550b5da80e6fb28b876cdb56a44d3c1e870f1912f3fe9f",
+        "src/host/service-types.ts": "ac95eff0ac0557d9106eae2a93d6074a84575321681e71d7000bfe2118d19c6c",
         "src/shared/types.ts": "14143f4e5323d33f9fd63c7dc00cee36acd86ee894f4f2cc5244211d9c25beab"
       }
     },

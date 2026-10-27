@@ -73,6 +73,8 @@ import type {
   FsService,
   HostContext,
   PresetRow,
+  SandboxExecutionPolicy,
+  SandboxPolicyService,
   SessionObservation,
   SessionQueryService,
   SkillDetail,
@@ -778,11 +780,51 @@ export function apply(ctx: HostContext): void {
       }
     }
 
+    /**
+     * 写入用的 per-call 沙箱策略。
+     *
+     * **为什么必须显式给**：`writeText` 的第 5 个参数省略时，`fs-sandbox` 走
+     * agentless 兜底 → 部署默认模式（本机 `workspace-write`）→ 工作区之外的
+     * `~/.dsh/skills`、`<project>/.agents/skills` 一律被拒。实测原文：
+     *
+     *     cannot write "C:\Users\admin\.dsh\skills\to-tickets\SKILL.md":
+     *     file access denied under workspace-write mode
+     *
+     * 也就是：**不显式给，这个开关对绝大多数 skill 根本用不了**。
+     *
+     * **为什么不抄会话当前的 mode**：这个开关是**设置动作**（用户在设置页点的），
+     * 不是模型在会话里改文件——同一页上换模型、开关插件也都不受会话文件沙箱约束。
+     * 所以这里显式声明 `danger-full-access`，把"这是宿主代表用户执行的设置写入"
+     * 写进调用本身，而不是让后端按模型的沙箱去猜。
+     *
+     * 暴露面很小：目标路径永远由宿主自己按四个规范根算出来（A36/B114 钉住），
+     * 客户端连路径都给不了；写的内容也只有那两行 frontmatter。
+     * @returns 策略，或 undefined（没有 sandboxPolicy 服务时就交给后端默认——那是裸后端，
+     *   不做任何围栏，写就是了）。
+     */
+    const writePolicy = (): SandboxExecutionPolicy | undefined => {
+      const policy = service<SandboxPolicyService>('sandboxPolicy')
+      if (typeof policy?.resolve !== 'function') return undefined
+      try {
+        const base = policy.resolve()
+        if (base === undefined || typeof base.workspaceRoot !== 'string') return undefined
+        return { mode: 'danger-full-access', workspaceRoot: base.workspaceRoot }
+      } catch {
+        return undefined
+      }
+    }
+
     /** 带版本护栏地写回一份文件。失败一律带着原因抛出去，绝不静默。 */
     const writeFileGuarded = async (file: WritableFile, next: string, signal: AbortSignal): Promise<void> => {
       const fsService = service<FsService>('fs')
       if (typeof fsService?.writeText !== 'function') throw new Error('宿主没有提供可写的文件系统服务')
-      await fsService.writeText(file.target, next, { kind: 'replaceIfVersion', version: file.version }, signal)
+      await fsService.writeText(
+        file.target,
+        next,
+        { kind: 'replaceIfVersion', version: file.version },
+        signal,
+        writePolicy(),
+      )
     }
 
     /**

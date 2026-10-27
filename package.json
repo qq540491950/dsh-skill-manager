@@ -1,6 +1,6 @@
 {
   "name": "@qq540491950/dsh-skill-manager",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "DSH 插件：在设置面板加一页「Skills」，按项目 / 全局 / 自定义 / 随包内置分组浏览 skill，并给每一行一个启用/关闭开关。",
   "keywords": [
     "dsh",

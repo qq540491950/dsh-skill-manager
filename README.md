@@ -281,6 +281,12 @@ skill 也一起消失**——页面上表现为「选了项目还是只有随包
 - **只改这两行**，其余字节原样保留（`rewriteInvocation` 逐字节重建头部，正文不动）——
   所以「关 → 开」能逐字节回到原文件（B109）。
 - 每次写都带 `{ kind: 'replaceIfVersion', version }` 护栏；拿不到版本就**不写**。
+- 写入必须**显式带 per-call 沙箱策略**（`writeText` 第 5 个参数），mode 是 `danger-full-access`。
+  省略它时 `fs-sandbox` 走 agentless 兜底 = 部署默认（本机 `workspace-write`），
+  工作区之外的 `~/.dsh/skills` 一律被拒——实测原文：
+  `cannot write "C:\Users\admin\.dsh\skills\to-tickets\SKILL.md": file access denied under workspace-write mode`。
+  为什么不抄会话当前的 mode：这个开关是**设置动作**（用户在设置页点的），和模型在会话里改文件
+  不是一类事。`workspaceRoot` 仍取自 `ctx.sandboxPolicy.resolve()`。（B121/B122 钉这条。）
 - 用 `writeText` 整文件替换而**不用 `editText`**：文本匹配式编辑可能撞上重复的
   `description` 片段。
 - **不接受客户端给的路径**：目标文件由宿主按规范根自己算（B114）。
@@ -593,6 +599,8 @@ skill 读回来。（`自定义` 那一格仍受上游影响，因为它指向�
 | **直读结果是"盘上有什么"，不是"模型能用什么"** | 提供方健康时两者一致（注册表优先，直读是空操作）。提供方被上游拖死时，直读能把项目/全局 skill **显示**出来，但那个会话的模型**仍然看不到它们**——本插件不改模型可见的目录（绝不 `ctx.skills.register()`）。 |
 | **开关只对四个规范根生效** | `custom` 的路径由 `Config.customSkillDirs` 决定（宿主读不到展开值），`bundled`/`runtime` 没有文件。这三类行的 `writable: false`，开关置灰。 |
 | **不做删除** | `ctx.fs` 没有 unlink/rmdir/rename。真删要起 shell 进程，会绕过沙箱围栏，且对 junction 有递归删目标的风险。要真删请用户自己删文件（页面给了路径）。 |
+| **写入不受会话文件沙箱约束** | 开关是**设置动作**，所以 `writeText` 显式带 `mode: 'danger-full-access'`——会话是 `read-only`/`workspace-write` 时也能改。理由：同一页上的模型选择、插件开关也不受会话文件沙箱约束；目标路径永远由宿主按四个规范根算出，内容只有两行 frontmatter。这是**有意**的偏离——别"顺手改成跟随会话 mode"，那会让工作区外的 skill 全都改不了（B121/B122）。 |
+| 总开关会抹平手写的 `user-invocable: false` | "开" = 删两个键（官方默认两者皆允许），所以只写了 `user-invocable: false` 的 skill 在关→开之后会回到两者皆允许。单开关语义的**已知代价**。 |
 | **总开关会抹掉手写的 `user-invocable: false`** | "开"= 删掉两个键（官方默认两者皆允许）。若某个 skill 原本只写了 `user-invocable: false`（想保留给模型自动调用、但不进 `/` 菜单），把开关关掉再打开会把这条意图抹平。单开关语义的**已知代价**，不是 bug。 |
 
 ---

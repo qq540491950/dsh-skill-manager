@@ -297,6 +297,10 @@ profile 的 `customSkillDirs` 指向 `app.asar` 内的 `<agent-preset>/skills`�
 - `writable` 由**来源**决定，不由"文件在不在"决定：`custom`（路径由 Config 决定，算不出来）
   与 `bundled`/`runtime`（无文件）一律 false → 界面置灰说明原因。**点了没反应比没有开关更糟。**
 - 生效不需要重启：provider watch 每个根，写完自己 invalidate。
+- **写入必须显式带沙箱策略**（`writeText` 第 5 个参数，mode = `danger-full-access`，B121/B122）。
+  省略时 `fs-sandbox` 用 agentless 兜底 = 部署默认（本机 `workspace-write`），工作区外的
+  `~/.dsh/skills` 一律被拒（用户实测原文 `file access denied under workspace-write mode`）。
+  **不要**改成"跟随会话当前 mode"——那会让 read-only / workspace-write 会话里这个开关**永远**改不了。
 
 ### 2.14 客户端开关：只改这一行，不整页刷新
 
