@@ -11,20 +11,21 @@
 **这是什么**：一个 DSH 插件，在设置面板加一页「Skills」，**只读**浏览当前会话可见的
 skill，按来源分组（项目 / 全局 / 自定义 / 随包内置）。**第一阶段没有任何写入路径。**
 
-**双半结构**：
+**双半结构**（源码在 `src/**`，`lib/**` 是 `tools/build.ts` 生成的产物，见 2.11）：
 
-| 半边 | 文件 | 职责 |
-|---|---|---|
-| 宿主 | `lib/index.js` | 零 import。`ctx.connection.fetch.register()` 开 `/api/skill-manager`；解析作用域后读 `ctx.skills`，**并只读直读四个规范根目录**（见 2.10）。 |
-| 客户端 | `lib/client.js` | `window.__ModuleLoader__` 懒 CJS bundle。注册 `settings.section`（list 座位，`order: 910`）。 |
+| 半边 | 源码 | 产物（运行时读的就是它） | 职责 |
+|---|---|---|---|
+| 宿主 | `src/host/index.ts`（+ `src/host/service-types.ts`） | `lib/index.js` | **产物零 import**。`ctx.connection.fetch.register()` 开 `/api/skill-manager`；解析作用域后读 `ctx.skills`，**并只读直读四个规范根目录**（见 2.10）。 |
+| 客户端 | `src/client/index.ts`（+ `src/client/service-types.ts`） | `lib/client.js` | `window.__ModuleLoader__` 懒 CJS bundle（包装由构建脚本注入，`id` 取自 `package.json.name`）。注册 `settings.section`（list 座位，`order: 910`）。 |
+| 共用 | `src/shared/types.ts` | 无（只有类型，被擦除） | payload 契约：两边各写一遍必然漂。 |
 
 **唯一必跑的命令**：
 
 ```powershell
-node tools/verify.mjs      # 期望 PASS 221/221
+node tools/verify.ts      # 期望 PASS n/n（以实际输出为准）
 ```
 
-**设计依据、已实测/未实测清单、证据出处**：`README.md`（第 3 节作用域解析、第 7 节实测状态、第 9 节 asar 解包）。
+**设计依据、已实测/未实测清单、证据出处**：`README.md`（第 3 节作用域解析、第 6 节安装与包形态、第 7 节实测状态、第 9 节 asar 解包）。
 
 ---
 
@@ -44,8 +45,10 @@ node tools/verify.mjs      # 期望 PASS 221/221
 `dsh-hmr` 只监听 DSH 安装目录 + profile 补丁文件；本仓库目录不在其中，且 Node 的 ESM
 按 URL 缓存模块。
 
-- 改 `lib/client.js` → 热替换（但**只有在 `pnpm run dev:web` 也在跑**时才免刷新；否则要刷新页面）
-- 改 `lib/index.js` → **不生效**，需重启 DSH
+- 改 `src/client/index.ts` → `npm run build` → 重载的 `lib/client.js` 才热替换
+  （但**只有在 `pnpm run dev:web` 也在跑**时才免刷新；否则要刷新页面）
+- 改 `src/host/index.ts` → 必须 `npm run build` **并且**重启 DSH。宿主半边既不热重载，
+  也不会自己重新构建：只重启不 build 跑的还是旧产物，只 build 不重启什么都不会变
 
 ### 1.3 不要重启 DSH
 
@@ -67,6 +70,9 @@ node tools/verify.mjs      # 期望 PASS 221/221
 | `- id: X` + `insert: [...]` | 追加进已存在 group 条目 X 的 config |
 | `- id: X`（无 insert） | **覆写**已存在条目 X；X 不存在则 warn 并**丢弃** |
 
+> 本插件那一行现在**也存在于本仓库的 `cordis.patch.yml`**（bundle 自带的补丁层，见 2.12）：
+> 手写行与 bundle 安装是**同 id 的两条条目**，后插入者赢且不报错，所以两者不能并存。
+
 ### 1.5 文件被并发编辑时按护栏重做，不要覆盖
 
 `edit` 报 `file changed since it was read` 时：**重新读取 → 基于新内容重做**，
@@ -76,11 +82,17 @@ node tools/verify.mjs      # 期望 PASS 221/221
 
 ## 2. 代码边界（抄近路 = 已知 bug）
 
-### 2.1 宿主半边**零 import**
+### 2.1 **产物**必须零 import（源码可以用 `import type`）
 
-本文件由 Loader 以 `file:///...` 绝对路径加载，裸模块说明符都在 app.asar 里，
-从磁盘路径解析不到。只用注入进来的 Service + 全局 `URL` / `Response` / `AbortController`。
-（A8–A10 钉这条。）
+`lib/index.js` 由 Loader 以 `file:///...` 绝对路径（bundle 安装后是包名）加载，裸模块说明符
+都在 app.asar 里，从磁盘路径解析不到。所以**产物里一行 import 都不许有**，只用注入进来的
+Service + 全局 `URL` / `Response` / `AbortController`。
+
+源码不是这么写的：`src/host/index.ts` 里可以写 `import type { … } from '../shared/types.ts'`，
+`src/shared/types.ts` 里只有类型。**「产物零 import」由两件事保证**：esbuild `bundle: true`
+把相对模块内联进单文件 + `verbatimModuleSyntax` 让类型导入整行被擦掉。
+（A8–A10 查产物文本——往源码里加一行**值**导入（裸模块），产物里就会留下 `import`/`require`，
+这几条立刻红；产物是不是从当前 `src/**` 构建出来的，由 E 区守。）
 
 ### 2.2 读 skill **必须带 scope**
 
@@ -177,6 +189,87 @@ profile 的 `customSkillDirs` 指向 `app.asar` 内的 `<agent-preset>/skills`�
 > 这条是对上游 bug 的**兜底**，不是"上游已修好"。上游那份 `customSkillDirs` 仍然会让
 > 「自定义」分组读不出来（那个路径本插件读不到）。
 
+### 2.11 构建流水线与产物契约：`src/**` → `lib/**`
+
+| 源码 | 产物 | 形态 |
+|---|---|---|
+| `src/host/index.ts`（+ `src/host/service-types.ts`、`src/shared/types.ts`） | `lib/index.js` | esbuild ESM 单文件，`src/shared/**` 全部内联 |
+| `src/client/index.ts`（+ `src/client/service-types.ts`、`src/shared/types.ts`） | `lib/client.js` | esbuild CJS 单文件 → `wrapClient()` 包成懒 CJS 工厂 classic script |
+| 两边的 `src/**` | `lib/types/**` | `tsc -b` 的 `emitDeclarationOnly` 产物（`exports.types` 指这里） |
+
+- **绝不手改 `lib/**`**。它是生成物：下一次 `npm run build` 直接覆盖，而且
+  `lib/.build-manifest.json`（每个产物的 sha256 + 它依赖的每个 src 输入的 sha256）会立刻对不上。
+  E 区钉这条（E1 manifest 覆盖两个产物 / E2 每个产物的 sha256 与当前文件一致 /
+  E3–E4 src 下每个 `.ts` 都被某个产物登记为输入 / E5 产物带 build.ts 的「不要直接编辑」banner），
+  CI 还多一道 `git diff --exit-code -- lib`：改了 `src/**` 忘了 build，红在那里，而不是让用户拿到过期产物。
+- `lib/**` **入库**（它是运行时产物，也在 `files` 里）：`git clone` + 路径行挂载、`github:`
+  安装都直接拿它——pnpm **不会**替你 build。
+- 构建参数是刻意的，别"顺手优化"：`minify: false`（自检按文本断言常量名与文案）、
+  `charset: 'utf8'`（默认会把中文转成 `\uXXXX`，按文案断言的自检会**静默**失效）、
+  客户端 `external: ['react']`（唯一允许的 `require`）、客户端 `id` 由构建脚本从
+  `package.json.name` 注入（**不要在源码里写第二份**）。
+- 相对 import **必须带 `.ts` 扩展名**（`allowImportingTsExtensions` +
+  `rewriteRelativeImportExtensions`）：自检脚本要能**直接跑 TS 源码**，而 Node 的 ESM
+  解析器不认无扩展名的相对路径。
+- Node **≥22.18**（原生类型擦除）：`node tools/build.ts` / `node tools/verify.ts`
+  都是零构建直接跑，不需要先编译。
+
+命令（`package.json`）：`npm run build`（src→lib + 指纹）、
+`npm run typecheck`（`tsc -b --clean && tsc -b && tsc -p tsconfig.tools.json`）、
+`npm run verify`（= `node tools/verify.ts`）、`npm run check`（前三步串起来）。
+
+### 2.12 发布形态是 bundle：`cordis.patch.yml` 自带插件行
+
+包名 `@qq540491950/dsh-skill-manager`，`type: module`，`main: lib/index.js`。
+**装一次 = 把包装进 profile 的 `node_modules` + 把包名选进 `dsh.profile.bundles`**，
+它的 patch 层随后自动插入 Loader 行 —— 用户**不再手写 profile 补丁**。
+
+`package.json` 的关键字段（P 区逐条钉住，别"简化"）：
+
+| 字段 | 值 | 为什么 |
+|---|---|---|
+| `dsh.manifestVersion` | `1` | bundle 清单版本 |
+| `dsh.bundle.patch` | `./cordis.patch.yml` | 这就是"层"。缺了装上也只是一个普通 npm 包 |
+| `dsh.client.platform` | `"web"` | 客户端半边活在 web GUI 里 |
+| `main` / `types` | `lib/index.js` / `lib/types/host/index.d.ts` | |
+| `exports` | `.`、`./client`、`./cordis.patch.yml`、`./locale/*.json`、`./package.json` | 后两个必须暴露，否则安装器读不到补丁层与文案 |
+| `files` | `lib`、`cordis.patch.yml`、`locale/*.json`、`assets/icon.svg`、`README.md`、`LICENSE` | 白名单：`src/**`、`tools/**`、`AGENTS.md` **不发** |
+| `engines` | `node >=22.18`、`dsh ^0.2.0-rc.2` | `dsh` 必须是**范围**：精确 pin 在升一个 rc 后会被判 incompatible |
+| `peerDependencies` | **只有** `@deepseek-ai/cordis ~4.0.4` | 多钉 `@deepseek-ai/dsh-*` = 每次 DSH 升级都失效 |
+
+`cordis.patch.yml` 里**只有插件自己一行，而且必须写在 `insert:` 下**（P3/P4 钉住）：
+
+```yaml
+- insert:
+    - id: dsh-skill-manager
+      name: '@qq540491950/dsh-skill-manager'
+```
+
+顶层 `- id: X` 是"覆写已存在条目"，目标不存在时 warn 并**丢弃**（见 1.4）——写成那样插件
+根本不会出现，表现就是「设置里没有 Skills 页」。
+
+**⚠️ 手写行与 bundle 安装不能并存。** profile 里那条
+`- insert: [{ id: dsh-skill-manager, name: 'file:///…/lib/index.js' }]` 与 bundle 插入的是
+**同 id 的两条条目**，后插入者赢、**不报错**，只会让人以为"装了个假的"。
+迁移顺序：① 备份 profile → ② `install_bundle` → ③ 确认页面在 → ④ **再**删手写行。
+
+安装/卸载/升级（`install_bundle` 的 `target` 是 **pnpm spec**，不是包名字段）：
+
+| spec 形式 | 例子 | 装前能否判定是 bundle |
+|---|---|---|
+| registry | `@qq540491950/dsh-skill-manager` | ✅ 问注册表 |
+| git | `github:qq540491950/dsh-skill-manager#v0.1.0` | ❌ 装后判定，不合格抛错并回滚 profile |
+| 本地绝对路径 | `D:\project\dsh-plugins\dsh-skill-manager` | ✅ 直接读目录 `package.json` |
+| `.tgz` | `…\qq540491950-dsh-skill-manager-0.1.0.tgz` | ❌ 同 git |
+
+升级 = **就地装新 spec**（git 路线换 `#ref`）；重复**同一个** spec 才会 `ambiguous-install`。
+卸载 `plugin_manager(action:'remove_bundle', target:'@qq540491950/dsh-skill-manager')`。
+宿主半边变了 → 装完**重启一次 DSH**（1.2）。
+
+**状态：尚未发布、尚未安装验证。** 本机 `npm whoami` → `ENEEDAUTH`（未登录），
+profile 本轮**没有被改动**，所以"装进 profile 后页面真的能用"这件事**未实测**。
+写文档时不许把它写成已验证。
+
 ---
 
 ## 3. UI 纪律
@@ -191,7 +284,7 @@ profile 的 `customSkillDirs` 指向 `app.asar` 内的 `<agent-preset>/skills`�
 - inline `background` 的优先级**高于** CSS 的 `:hover` → 按钮永远没有悬停反馈
 - inline `height` 会压过样式表
 
-inline 只允许布局属性（白名单见 `tools/verify.mjs` 的 `INLINE_ALLOWED`）。（A27 钉这条。）
+inline 只允许布局属性（白名单见 `tools/verify.ts` 的 `INLINE_ALLOWED`）。（A27 钉这条。）
 
 ### 3.3 `order` 与席位
 
@@ -279,14 +372,15 @@ inline 只允许布局属性（白名单见 `tools/verify.mjs` 的 `INLINE_ALLOW
 ### 4.1 动手前先跑自检
 
 ```powershell
-node tools/verify.mjs
+node tools/verify.ts       # 只跑自检（零依赖，不用装 node_modules）
+npm run check              # typecheck + build + verify，交付前跑这条
 ```
 
 改动前 PASS、改动后 FAIL，才能证明是你的改动引起的。
 
 ### 4.2 每修一个 bug，**同时加断言**
 
-四个区：
+六个区：
 
 | 区 | 覆盖 |
 |---|---|
@@ -294,6 +388,10 @@ node tools/verify.mjs
 | B | **宿主半边行为**：假 ctx 真跑 `apply`、真发 `Request`，断言解析链、租约释放、分组、读取、**直读兜底与合并规则** |
 | C | 客户端协议：假 `window.__ModuleLoader__` 真跑 factory，断言座位注册项与 require 面 |
 | D | **真实渲染**：迷你渲染器展开函数组件（含 hook 顺序计数），覆盖就绪/空/失败/**无诊断**/展开正文 |
+| E | **产物契约 / 构建新鲜度**：`lib/.build-manifest.json` 覆盖两个产物、每个产物的 sha256 与 `lib/**` 现状一致、`src/**` 下每个 `.ts` 都被登记为输入（改了 src 忘了 build 立刻红）、产物带 build banner |
+| P | **发布形态**：`dsh.bundle.patch` 与 patch 行形状（在 `insert:` 里、`id`/`name` 对齐）、`locale`、`icon`、`files`、`exports`、`engines`、`peerDependencies` 只允许 `@deepseek-ai/cordis`、密钥扫描 |
+
+A–D 查**行为**，E/P 查**"能不能交出去"**：E 拦"产物与源码不符"，P 拦"包字段被顺手简化"。
 
 ### 4.3 新断言必须做**反向验证**
 
@@ -311,11 +409,15 @@ node tools/verify.mjs
    例：`color:var(--dsw-alias-label-primary);` 在两个选择器里都出现。
    正确做法：反向验证脚本先断言锚点**恰好出现 1 次**，否则判该用例失效。
    **本轮也踩到**：用 PowerShell 写注入脚本时反引号被吃掉，锚点静默变成 0 次命中，
-   看起来像"注入了但不报错"。**注入脚本要写成 `.mjs` 文件**，不要塞进 `node -e` 字符串。
+   看起来像"注入了但不报错"。**注入脚本要写成独立文件**（`.mjs` / `.ts`）再跑，
+   不要塞进 `node -e` 字符串。
 3. **断言里带半真半假的「或」** → 等于没断言。
    例：`a === undefined || b === c` 其中一支恒真。要么拆成两条，要么只留真判断。
 4. **注入打错了半边** → D 区用的是**客户端夹具**，往宿主里注入 `roots` 对 D 区毫无影响。
-   要验 D 区的断言，必须注入 `lib/client.js`。（第一次就这么写错，报出"没报出"。）
+   要验 D 区的断言，必须注入客户端半边。（第一次就这么写错，报出"没报出"。）
+   **产物是生成的**：注入一律打在 `src/**` 上再 `npm run build`——直接改 `lib/client.js`
+   会被 E 区的指纹断言（以及 CI 的 `git diff --exit-code -- lib`）抓出来，于是你分不清
+   是"注入没生效"还是"没重新构建"。
 5. **平凡通过的断言** → **一条永远不会失败的断言等于没有断言**，比没有更糟，因为它给人
    虚假的安全感。例：B65 原本断言"fs 抛错时目录读取仍成功"——可 `pathExists` 自己已经
    吞掉了 fs 异常，外层兜底 catch 永远跑不到，删掉兜底也照样 PASS。
@@ -350,6 +452,43 @@ B54 不返回 roots / B64 未判定误报为不存在 / B68 探测出错就整�
 > （`if (sessionId !== undefined) params.set(...)`、`buildTabs` 取代 buckets 都发生过）。
 > 跑反向验证时如果报「锚点出现 0 次」，先改用例再下结论。
 
+### 4.4 本轮（TypeScript 化 + 改为 bundle 发布）的反向验证记录
+
+针对**新增的 A0 / E 区 / P 区**断言：**13/13 全部按预期报出，且全部逐字节还原**。
+脚本是一次性文件（`tools/.tmp/reverse.mjs`，跑完即删），每个用例的固定动作：
+① 先确认锚点在目标文件里**恰好出现 1 次**（否则判该用例无效）→ ② 注入 → ③ 跑
+`node tools/verify.ts` → ④ 从 stderr 的失败行里读回断言 id → ⑤ **无条件还原**并与注入前
+字节比对。
+
+| 注入 | 应当报出 | 实测报出 |
+|---|---|---|
+| `package.json` 缺 `name` 字段 | A0 | A0（连带 A1/A7/P4/C2） |
+| `dsh.bundle.patch` 指向不存在的文件 | P1 | P1（连带 P3/P4） |
+| `dsh.manifestVersion` 改成 `2` | P2 | P2 |
+| 插件行写成顶层 `- id:`（不是 `insert:` 下） | P3 | P3（连带 P4） |
+| 补丁行 `name` 与包名不符 | P4 | P4 |
+| `files` 漏掉 `LICENSE` | P8[LICENSE] | P8[LICENSE] |
+| `files` 里混进 `src` | P9 | P9 |
+| `license` 字段清空 | P11 | P11 |
+| `peerDependencies` 多钉一个 `@deepseek-ai/dsh-*` | P14 | P14 |
+| 手改 `lib/index.js` | E2[lib/index.js] | E2[lib/index.js] |
+| 改 `src/shared/types.ts` 但不 build | E3（两个产物各一条） | E3[lib/index.js ← …]、E3[lib/client.js ← …] |
+| 产物丢了 build banner | E5[lib/client.js] | E5[lib/client.js]（连带 E2） |
+| 发布文件里混进密钥（README 插 `tvly-`） | P15[README.md] | P15[README.md] |
+
+本轮新踩到两个"看起来像没报出"的坑（补进上面的陷阱清单）：
+
+1. **有的注入面根本到不了被测代码**：想用「把 `package.json` 写成非法 JSON」测 A0，
+   结果 **Node 自己**就因 `ERR_INVALID_PACKAGE_CONFIG` 起不来（最近的 `package.json`
+   非法时连入口都不解析）。那是注入面无效，不是断言无效——改成「删 `name` 字段」才验得到。
+2. **失败行 id 里可能带空格**（`E3[lib/index.js <- src/shared/types.ts]`）。反向脚本若用
+   `^\s+x (\S+?):` 抓 id，就会把 E3/E4 这类 id **全漏掉**，看起来像"没报出"。用
+   `^ {2}x (.+?): `。
+
+> A0 这条本身也是这一轮补的：`package.json` 读不到 / 解析不了时，自检**不许**在解引用处
+> 崩掉（崩掉的输出里一条失败行都没有，见 5.5）。现在解析失败会落成一条干净的
+> `x A0: …`，后面的断言照常跑完。
+
 ### 4.5 测交互时，**事件闭包是当次渲染的**
 
 `onChange` / `onClick` 闭包捕获的是**那一次渲染**的状态。先抓按钮节点、再触发状态变更、
@@ -370,7 +509,7 @@ B54 不返回 roots / B64 未判定误报为不存在 / B68 探测出错就整�
 
 ---
 
-## 5. 自检工具自身的坑（写 `tools/verify.mjs` 前必读）
+## 5. 自检工具自身的坑（写 `tools/verify.ts` 前必读）
 
 ### 5.1 D 区必须用**活的** react 重新加载 bundle
 
@@ -424,15 +563,18 @@ effect 里的数据链是 `async/await` + `.then(setState)`。只 `await` 一个
 
 声称"做完了"之前必须给出：
 
-1. `node tools/verify.mjs` 的输出（`PASS n/n`）
+1. `npm run check` 全绿（typecheck + build + verify），外加 `node tools/verify.ts` 的
+   `PASS n/n`（**以实际输出为准**，不要抄一个数字）
 2. 反向验证结果（哪几条注入了违规、报出了什么、是否已还原）
-3. 编码检查：无 BOM、无 `U+FFFD`、LF 行尾（A30–A32 会自动查源码；文档与配置另查）
+3. 编码检查：无 BOM、无 `U+FFFD`、LF 行尾（A30–A32 查 `src/**`；**产物是生成的、也要查**——
+   真正发到用户机器上的是 `lib/**`；文档与配置另查）
 
    ```powershell
-   node -e "const fs=require('fs');const b=fs.readFileSync('lib/client.js');const t=b.toString('utf8');console.log((b[0]===0xEF?'BOM!':'no-bom'),(t.includes(String.fromCharCode(0xFFFD))?'FFFD!':'clean'),'crlf='+(t.match(/\r\n/g)||[]).length)"
+   node -e "const fs=require('fs');for (const p of ['src/host/index.ts','src/client/index.ts','lib/index.js','lib/client.js','README.md','AGENTS.md']) { const b=fs.readFileSync(p); const t=b.toString('utf8'); console.log(p, (b[0]===0xEF?'BOM!':'no-bom'), (t.includes(String.fromCharCode(0xFFFD))?'FFFD!':'clean'), 'crlf='+(t.match(/\r\n/g)||[]).length) }"
    ```
 
-4. 改了什么、**为什么**、以及**哪些部分没有实测**
+4. 改了什么、**为什么**、以及**哪些部分没有实测**。动过 `src/**` 的话，还要确认 `lib/**`
+   已重新构建并**一并提交**（只提交源码会让 E 区与 CI 的 `git diff --exit-code -- lib` 变红）
 
 **安装与座位注册本身不等于"用户能看见"。** 没有实测的部分必须明说，
 不要把推断写成结论。本仓库明确区分"已实测"与"未实测"（`README.md` 第 7 节）。
@@ -445,6 +587,7 @@ effect 里的数据链是 `async/await` + `.then(setState)`。只 `await` 一个
 - 提交信息用中文，结构：`feat|fix|docs: 一句话` + 空行 + 分节说明（接入点 / 数据面 / 正确性 / UI / 自检）
 - 提交信息**写进 UTF-8 文件后用 `git commit -F` 传入**，不要用 `-m` 直传中文（见 1.1）
 - 提交前扫密钥：本仓库不得包含真实 token / API key
+- `lib/**` 是**生成物但入库**：改了 `src/**` 就 `npm run build` 后一并提交（见 2.11）
 - `.gitattributes` 强制 LF；不要引入 CRLF（混入会产生整文件 diff）
 - 沙箱下 `git push` 的 stderr 进度输出会被 PowerShell 当成错误记录并给出 `[exit code: 1]`，
   这是**假警报**——以 `git ls-remote` 与 `git status -sb` 为准
@@ -455,7 +598,7 @@ effect 里的数据链是 `async/await` + `.then(setState)`。只 `await` 一个
 
 | 边界 | 说明 |
 |---|---|
-| 宿主半边不热重载 | 见 1.2 |
+| 宿主半边不热重载 | 见 1.2（改 `src/host/**` 要 build **并且**重启） |
 | 导航图标不可由插件提供 | 见 3.4 |
 | 未接 `ctx.locale` | 官方 practices 要求文案走 Client locale 服务；本插件硬编码中文，与同目录 `dsh-mcp-manager` 一致。**有意的偏离。** |
 | `order` 不保证"永远最后" | 910 只是大于 MCP 的 900 |
@@ -463,6 +606,9 @@ effect 里的数据链是 `async/await` + `.then(setState)`。只 `await` 一个
 | 无 body 修订协议 | 上游：已加载的正文是普通历史，编辑文件不会改写旧结果 |
 | `listTokens` 不是完整 token 表 | 它只列需要 light/dark 双份覆写的 alias 子集；判断 token 是否存在以官方 CSS 用法为准 |
 | 宿主日志基本不可看 | 要靠自检 + 渲染测试兜住，不能靠"跑起来看看" |
+| **`lib/**` 是生成物** | 源码在 `src/**`，改完必须 `npm run build`。手改 `lib/**` 会被下一次构建覆盖，且 E 区 + CI 的 `git diff --exit-code -- lib` 会红（见 2.11） |
+| **bundle 安装未实测、包未发布** | 还没装进任何 profile，也没 `npm publish`（本机 `npm whoami` → `ENEEDAUTH`）。"装完页面就能用"目前是**推断**，不是实测（见 2.12） |
+| **包图标渲染未见** | `assets/icon.svg` 只是 bundle 清单字段；座位注册字段白名单里没有 `icon`（3.4），它不进导航图标。界面里实际什么样**没看过** |
 | **上游 provider 会被一个坏根目录整条拖死** | `dsh-skill-filesystem.list()` 没有 per-root try/catch。**本插件用直读兜底（见 2.10），但那不等于上游修好了**：`customSkillDirs`（本机指向 app.asar 内的 `<agent-preset>/skills`）仍然读不出来，「自定义」分组因此仍可能是 0。修它属于 profile 配置，不归本插件。 |
 | **直读的 frontmatter 解析是子集** | 宿主半边零 import，拿不到官方的 `yaml` 包，只实现了 `key: value` / 块标量 / 引号标量。比官方严格或宽松的写法都会导致「少列」或「多列」。因此**逐条对齐官方的硬性要求**（B80），并且**宁可漏也不编**。 |
 | 阶段一没有写入 | 这是范围，不是缺口。要加写入时，走 `ctx.configEditor.edit()`（外科手术式 YAML 编辑），**禁止** `ctx.loader.create()/remove()`（`EntryTree.write()` 会整体重写、压平用户手写的 `insert:` 分节） |

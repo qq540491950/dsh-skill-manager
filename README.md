@@ -5,20 +5,24 @@ DSH Web 客户端插件：在**设置面板**里加一页「Skills」，**只读
 
 **第一阶段范围**：只做查看。没有任何创建、编辑、删除、启停路径——没有
 `ctx.configEditor.edit()`，不碰 `~/.dsh/profiles/**`，不碰 `ctx.loader.*`。
-`tools/verify.mjs` 的 A11–A15 就是钉这条纪律的。
+`tools/verify.ts` 的 A11–A15 就是钉这条纪律的。
 
 ```powershell
-node tools/verify.mjs      # 期望 PASS 221/221
+npm run check              # typecheck + build + verify（交付前跑这条）
+node tools/verify.ts       # 只跑自检；零依赖，不装 node_modules 也能跑
 ```
 
 ---
 
 ## 1. 双半结构
 
-| 半边 | 文件 | 职责 |
-|---|---|---|
-| 宿主 | `lib/index.js` | 零 import。用 `ctx.connection.fetch.register()` 开一条只读路由 `/api/skill-manager`，内部解析作用域后读 `ctx.skills`，**并只读直读四个规范根目录**（§3.3）。 |
-| 客户端 | `lib/client.js` | `window.__ModuleLoader__` 懒 CJS bundle。往 `settings.section`（list 座位，`order: 910`）注册一页，同源 `fetch` 取数并渲染。 |
+源码在 `src/**`，`lib/**` 是 `tools/build.ts` 生成的产物（见 §6.5）；运行时读的是后者。
+
+| 半边 | 源码 | 产物 | 职责 |
+|---|---|---|---|
+| 宿主 | `src/host/index.ts`（+ `service-types.ts`） | `lib/index.js`（ESM 单文件） | **产物零 import**。用 `ctx.connection.fetch.register()` 开一条只读路由 `/api/skill-manager`，内部解析作用域后读 `ctx.skills`，**并只读直读四个规范根目录**（§3.3）。 |
+| 客户端 | `src/client/index.ts`（+ `service-types.ts`） | `lib/client.js`（懒 CJS 工厂） | `window.__ModuleLoader__` 懒 CJS bundle（包装与 `id` 由构建脚本注入）。往 `settings.section`（list 座位，`order: 910`）注册一页，同源 `fetch` 取数并渲染。 |
+| 共用 | `src/shared/types.ts` | 无（只有类型，被擦除） | 两半边共用的 payload 契约。 |
 
 ---
 
@@ -174,7 +178,7 @@ skill 也一起消失**——页面上表现为「选了项目还是只有随包
 `@deepseek-ai/dsh-agent-preset/skills`，把那里的随包 skill 谎报成"项目 skill"是错的。
 未识别的 source 落 `other` 并原样显示标签。
 
-分组由**宿主**算（`lib/index.js` 的 `GROUPS`），客户端不重新推导——两边各推一次必然漂。
+分组由**宿主**算（`src/host/index.ts` 的 `GROUPS`，产物 `lib/index.js`），客户端不重新推导——两边各推一次必然漂。
 
 ---
 
@@ -256,32 +260,146 @@ skill 也一起消失**——页面上表现为「选了项目还是只有随包
 
 ---
 
-## 6. 接线方式（**已接线**）
+## 6. 接线方式：以 **bundle** 安装（不再是手写 profile 补丁）
 
-**2026-10-12 已挂载**（用户实测截图里设置导航出现了「Skills」，`resolvedBy=session-agent`）。
-接线方式与同目录的 `dsh-mcp-manager` 完全一致（「路径行」：Loader 行指向磁盘上的宿主入口，
-不需要 pnpm / node_modules），加在 `~/.dsh/profiles/desktop/cordis.patch.yml` 末尾：
+本包已改造成 **bundle**：`package.json` 声明 `dsh.manifestVersion: 1` 与
+`dsh.bundle.patch: "./cordis.patch.yml"`。装一次同时做两件事——把包装进 profile 的
+`node_modules`，并把包名写进 `dsh.profile.bundles`；它的 patch 层随后自动插入 Loader 行。
+**用户不需要再手写 `cordis.patch.yml`。**
+
+> 历史：本插件最初（2026-10-12）是以「路径行」手写挂到
+> `~/.dsh/profiles/desktop/cordis.patch.yml` 末尾的，那一版实测页面渲染成功。
+> 现在是 bundle 形态；手写行必须按 §6.3 的顺序迁走。
+
+### 6.1 bundle 自带的补丁层只有插件自己一行
+
+`cordis.patch.yml`（`dsh.bundle.patch` 指向它）全文就这一条：
 
 ```yaml
-# ---------------------------------------------------------------------------
-# skill 只读浏览插件：在设置面板加一页「Skills」（order 910，排在 MCP 页之后）。
-#   - 宿主半边：D:\project\dsh-plugins\dsh-skill-manager\lib\index.js
-#     （零 import；用 ctx.connection.fetch.register 开 /api/skill-manager）
-#   - 客户端 bundle 由 @deepseek-ai/dsh-client-modules 从该包 package.json 的
-#     exports["./client"] 定位，并由 Host 在 /plugins 下发布。
-# 自检：node D:\project\dsh-plugins\dsh-skill-manager\tools\verify.mjs
-# 移除：删掉下面这个条目即可（settings.section 是 list 座位，不遮蔽任何官方 UI）。
-# ---------------------------------------------------------------------------
+- insert:
+    - id: dsh-skill-manager
+      name: '@qq540491950/dsh-skill-manager'
+```
+
+三点都钉在自检 P 区：
+
+1. **必须在 `insert:` 下。** 顶层 `- id: X` 的语义是「覆写已存在条目」，目标不存在时
+   `applyEntryPatches` 直接 warn 并丢弃 → 插件根本不出现，表现出来就是「设置里没有 Skills 页」（P3）。
+2. `name` 必须等于 `package.json.name`（P4）——安装器按包名解析；`file:///…` 形式只在手写挂载时用。
+3. 这一行与 profile 里那条手写行**同 id**，不能并存（§6.3）。
+
+### 6.2 四种安装 spec
+
+`plugin_manager(action:'install_bundle', target: …)` 的 `target` 是 **pnpm spec**，不是"包名字段"：
+
+| 形式 | 写法 | 装前能否判定是 bundle | 适用场景 |
+|---|---|---|---|
+| registry | `@qq540491950/dsh-skill-manager`（可带版本范围） | ✅ 问注册表 | 发布后的主渠道 —— **本包本轮未发布** |
+| git | `github:qq540491950/dsh-skill-manager#v0.1.0` | ❌ 装后才判定，不合格抛错并回滚 profile | 不需要 npm 账号 |
+| 本地绝对路径 | `D:\project\dsh-plugins\dsh-skill-manager` | ✅ 直接读目录 `package.json` | 开发循环，最便宜 |
+| `.tgz` | `…\qq540491950-dsh-skill-manager-0.1.0.tgz` | ❌ 同 git | 从 Release 资产装 |
+
+装完**读返回值**判定，不要只看日志：`application` 应为 `applied`，`warnings` 里不该有
+bundle skipped。宿主半边变了的话返回 `restart-required` 是正常的（装完重启一次 DSH）。
+
+### 6.3 从手写 profile 补丁迁移（顺序不能反）
+
+历史上 profile 末尾那条是：
+
+```yaml
 - insert:
     - id: dsh-skill-manager
       name: 'file:///D:/project/dsh-plugins/dsh-skill-manager/lib/index.js'
 ```
 
-注意：**补丁层新增条目必须用 `insert:` 追加**；裸 `- id: ...` 会被当作"覆写已存在条目"，
-目标不存在时 warn 并丢弃。
+它和 bundle 插入的是**同 id 的两条条目**。`applyEntryPatches` 的顶层 `insert` 就是
+`data.push(...insert)`、`buildMap` 只是 `Map.set` → **后插入者赢，不报错**：页面看着毫无变化，
+只会让人以为"装了个假的"。
 
-> ⚠️ **改 `lib/index.js` 必须重启 DSH 才生效**（宿主半边不参与热重载，见 §8）。
-> 本插件是**磁盘路径行**，所以改代码不需要 pnpm 构建，但需要重启。
+迁移顺序：
+
+1. 备份 `~/.dsh/profiles/desktop/` 的 `package.json` 与 `cordis.patch.yml`（带时间戳 `.bak`）；
+2. `install_bundle`（用**本地路径**最便宜：装前就能判定是不是 bundle，失败什么都不改）；
+3. 确认页面在，且**只有一格**：
+   `cordis_inspect_query(client, Slots, listSubTree, {"root":"settings.section"})` 里应是
+   `{ id: 'skills', order: 910, active: true }`；按包名查 `Config.listConfigs` 应命中**包名**
+   而不是 `file://` 路径；
+4. 这时才删 profile 里那条手写行（用最小行级改动，见 AGENTS.md §1.4）。
+
+### 6.4 卸载与升级
+
+- 卸载：`plugin_manager(action:'remove_bundle', target:'@qq540491950/dsh-skill-manager')`
+  → 插件行与客户端座位一起消失，profile 里不再有该依赖。（机制如此；本仓库**未实测**，见 §6.7。）
+- 升级：**就地装新 spec**（git 路线换 `#ref`，路径路线直接重装目录）。重复**同一个** spec 才会
+  报 `ambiguous-install`；换 spec 不会。
+- 宿主半边（`src/host/**` → `lib/index.js`）变了：`npm run build` + **重启一次 DSH**（见 §8）。
+
+### 6.5 目录结构与构建
+
+```
+src/host/index.ts            宿主半边源码（service-types.ts = 它用到的 Service 形状）
+src/client/index.ts          客户端半边源码（service-types.ts 同上）
+src/shared/types.ts          两半边共用的 payload 契约（**只有类型**）
+        │  npm run build（tools/build.ts，esbuild）
+        ▼
+lib/index.js                 宿主产物：ESM 单文件，零 import（shared 全内联）
+lib/client.js                客户端产物：懒 CJS 工厂 classic script（id 取自 package.json.name）
+lib/types/**                 tsc 产出的 .d.ts（exports.types 指 lib/types/host/index.d.ts）
+lib/.build-manifest.json     产物指纹：每个产物 + 每个 src 输入的 sha256
+tools/build.ts               构建脚本（直接跑：node tools/build.ts）
+tools/verify.ts              自检（零依赖，不装 node_modules 也能跑）
+locale/en.json, zh.json      meta.title / meta.description（给 bundle 清单用）
+assets/icon.svg              包图标（`icon` 字段；**不是**座位图标，见 §8）
+cordis.patch.yml             bundle 的补丁层（§6.1）
+.github/workflows/ci.yml     零依赖自检 → npm ci → npm run check → git diff --exit-code -- lib
+```
+
+| 命令 | 做什么 |
+|---|---|
+| `npm run build` | `src/**` → `lib/**`，并写 `lib/.build-manifest.json` |
+| `npm run typecheck` | `tsc -b --clean && tsc -b && tsc -p tsconfig.tools.json` |
+| `node tools/verify.ts` | 自检（**唯一必跑**）|
+| `npm run check` | 上面三步串起来 |
+
+两条约束写进了 tsconfig，而不是只写在这里：宿主 project 的 `lib` 只有 `ES2022` +
+`types: ["node"]`、**没有 DOM**；客户端 project 正好相反（`DOM` + `types: ["react"]`、
+没有 node 全局）。相对 import **必须带 `.ts`**（`allowImportingTsExtensions` +
+`rewriteRelativeImportExtensions`），因为自检脚本要能直接跑 TypeScript 源码。
+Node **≥22.18**：`node tools/build.ts` / `node tools/verify.ts` 靠原生类型擦除直接跑。
+
+**`lib/**` 是生成物但入库**：它是运行时产物、也在 `files` 里，`git clone` + 路径行、
+`github:` 安装都直接拿它（pnpm 不会替你 build）。所以改了 `src/**` 必须 `npm run build`
+并一并提交——漂移由 `lib/.build-manifest.json`（E 区断言）和 CI 的
+`git diff --exit-code -- lib` 拦住。**不要手改 `lib/**`。**
+
+### 6.6 npm 包形态与 `npm pack` 审查清单
+
+`files` 白名单（刻意的，不含 `src/`、`tools/`、`AGENTS.md`）：
+
+```
+lib  cordis.patch.yml  locale/*.json  assets/icon.svg  README.md  LICENSE
+```
+
+`npm pack --dry-run` 之后逐项看（**本轮已实跑**，结果见 §7.1；这里给的是"以后怎么复查"）：
+
+- **有**：`package/lib/index.js`、`lib/client.js`、`lib/types/**`、`lib/.build-manifest.json`、
+  `cordis.patch.yml`、`locale/{en,zh}.json`、`assets/icon.svg`、`README.md`、`LICENSE`；
+- **没有**：`src/`、`tools/`、`node_modules/`、`.tsbuildinfo`、`*.tgz`；
+- 扫密钥：不得出现真实 token / API key；
+- `package.json` 里 `dsh.bundle.patch`、`dsh.client.platform`、`icon`、
+  `exports["./cordis.patch.yml"]`、`exports["./locale/*.json"]` 都还在
+  （P 区在源码侧已钉过一遍，这里看的是**实际打出来的包**）。
+
+### 6.7 状态：未发布、未真装
+
+| 项 | 状态 |
+|---|---|
+| 包改造（字段 / patch 层 / locale / icon / LICENSE / CI） | 已完成；静态断言在 P 区 |
+| 真装进 profile | **未实测**（本轮用户明确要求不动 profile） |
+| `npm publish` | **未做**：本机 `npm whoami` → `ENEEDAUTH`（未登录） |
+| 图标在界面里的观感 | **未见**：v0.1.0 的 `icon` 只进 bundle 清单，座位注册不吃它 |
+
+所以 §7.2 的"未实测"清单照旧有效。**不要因为包里有了这些字段就写成"已发布"。**
 
 ---
 
@@ -301,13 +419,16 @@ skill 也一起消失**——页面上表现为「选了项目还是只有随包
 | `source` / `provider` 被官方 Remote 裁掉 | 同文件 `:163-169` |
 | 座位声明在 `sidebar.settings.children` 里，未声明的座位直接 register 会抛错 | `dsh-client-ui-settings-general/lib/client.js:1136-1139` |
 | `navIcon(id)` 硬编码查表、未知 id 兜底齿轮 | 同文件 `:244-270` |
-| 挂载后 `dsh --profile web --patch <改后的补丁文件> --dump-config` 仍 exit 0（真实 Loader 接受该文件） | 见 §6 |
+| 挂载后 `dsh --profile web --patch <改后的补丁文件> --dump-config` 仍 exit 0（真实 Loader 接受该文件） | 历史手写挂载那一轮（现已被 bundle 安装取代，见 §6.3） |
 | **页面在真实 GUI 里渲染成功**：设置导航出现「Skills」；`resolvedBy=session-agent`、`presetId=cordis`、`cwd` 正确 | 用户 2026-10-12 实测截图 |
 | **`ctx.fs` 在宿主根上确实存在**：`fs-sandbox`（`dsh-fs-sandbox`）挂在 profile 顶层（`cordis.yml:451-452`）；直读走的 `resolve`/`listDir`/`stat`/`readText` 与官方 provider 用的是同一个服务 | profile `cordis.yml` + `dsh-fs-local/lib/index.js:87909-87992`（服务契约） |
 | **项目根里确实有 skill**：`D:\project\agent-go\.agents\skills` 存在，含 8 个 `SKILL.md`（`edd-prototype`/`git-commit`/`git-push`/`handoff`/`personal-weekly-report`/`req`/`wails3-upgrade`/`weekly-report`） | 直接列目录（第二次实测期间） |
 | **本机确实没有项目/全局 skill（第一次实测时）**：`.dsh/skills`、`.agents/skills`（项目侧）与 `~/.dsh/skills` 都不存在，`~/.agents/skills` 存在但为空 | 直接列目录 |
 | **`dsh-skill-office` 显式以 `source:"bundled"` 注册**（不是文件系统根） | `dsh-skill-office/lib/index.js:71` + `BUNDLED_SKILL_RANK` |
-| 本插件自身：**221/221 断言全绿**，且 **11/11 反向验证**逐条精确报错 | `node tools/verify.mjs` |
+| 本插件自身：`npm run check` 全绿（typecheck + build + verify **PASS 296/296**），含本轮新增的 **A0**（package.json 解析失败不许崩）、**E 区**（产物契约 / 构建新鲜度 / banner，E1–E5）与 **P 区**（发布形态，P1–P15） | `npm run check` 的实际输出 |
+| **2026-10-27 本轮反向验证 13/13**：A0 / P1 / P2 / P3 / P4 / P8 / P9 / P11 / P14 / E2 / E3 / E5 / P15 逐条按预期报出断言 id，且注入文件全部逐字节还原 | 记录见 `AGENTS.md` 4.4（含本轮新踩到的两个坑） |
+| `npm pack --dry-run` 实际打出 **15 个文件**：`lib/index.js`、`lib/client.js`、`lib/types/**`（5 个 `.d.ts`）、`lib/.build-manifest.json`、`cordis.patch.yml`、`locale/{en,zh}.json`、`assets/icon.svg`、`README.md`、`LICENSE`、`package.json`；包内**没有** `src/`、`tools/`、`node_modules/`、`.tsbuildinfo`、`*.tgz` | `npm pack --dry-run` 的实际输出（40.3 kB tarball / 111.1 kB unpacked） |
+| 历史那一轮 **11/11 反向验证**逐条精确报错（直读兜底 + 诊断下线那一版代码） | 该轮脚本输出（旧骨架，已被本轮 13/13 取代） |
 
 ### 7.1.1 上游问题：`customSkillDirs` 指向 app.asar（**不是本插件的 bug**）
 
@@ -381,19 +502,23 @@ skill 读回来。（`自定义` 那一格仍受上游影响，因为它指向�
 
 | 项 | 为什么没测 | 怎么补 |
 |---|---|---|
-| **修复后的页面（221/221 这一次）** | 直读与提示下线都改在**宿主半边**（`lib/index.js`），而宿主半边不热重载 —— 必须重启 DSH 才看得到 | 重启 DSH 后看 设置 → Skills，并切一次范围下拉 |
+| **修复后的页面（直读兜底 + 诊断下线那一版）** | 那些改动都在**宿主半边**（`src/host/index.ts` → 产物 `lib/index.js`）：宿主半边不热重载，产物也不会自己重新构建 —— 必须 `npm run build` **并且**重启 DSH 才看得到 | `npm run build` 后重启 DSH，看 设置 → Skills，并切一次范围下拉 |
 | **直读在真实 `fs-sandbox` 上的读权限** | 自检里 `ctx.fs` 是替身。`fs-sandbox` 的 README 说「读取、列出、元数据操作与 `fs-local` 完全一致；变更围栏不限制观察」，所以直读应当畅通——但**这一条是读文档得出的，不是实测**。若被拒，表现是直读那一路**安静地 0 条**（每根各自兜底，不会报错） | 重启后看 `项目 + 全局` 是否出现 `agent-go` 的那 8 个 skill |
 | **真实 `SKILL.md` 的 frontmatter 是否能被手写解析器吃下** | 自检用的是我自己造的夹具。本机那 8 个文件的真实写法只做过**人工抽查**，没有跑过对比 | 重启后逐个对照：直读列出来的名字应等于官方 `skill` 工具能加载的名字 |
 | **`agentPresets.acquireScope(默认 preset)` 在本 profile 是否成功** | 实测走的是活 Agent 路径（已成功），冷读租约那条一次都没被触发 | 不选 session 直接看页面 |
 | **preset 自带 skill 能否恢复** | 取决于上游 `customSkillDirs` 的修复（见 7.1.1） | 修好 profile 后「自定义」分组会出现内容 |
 | **深浅两套主题下的实际观感** | 主题切换未测 | 切换主题看一遍 |
 | `B52` 截断边界之外的超大正文 | 只测了 200010 字符一例 | 可选 |
+| **bundle 真装进 profile** | 本轮用户明确要求不动 profile，所以一次都没装过；"装完页面就能用"目前是**推断** | 按 §6.3 备份 profile → `install_bundle`（本地路径）→ 查座位只有一格 → 再删手写行 |
+| **`npm publish` / 按 registry 名再装一次** | 本机 `npm whoami` → `ENEEDAUTH`，没有登录 | 登录后 `npm publish --access public`，再 `install_bundle` 包名复验 |
+| **`npm pack` 的实际内容** | 没跑（清单见 §6.6） | `npm pack` + 解包逐项对照 §6.6 |
+| **包图标在界面里的渲染** | 没看过：`icon` 只进 bundle 清单，座位注册字段里没有它 | 装好后看插件列表/卡片里的图标 |
 
 **安装与座位注册本身不等于"用户能看见"。** 没有实测的部分必须明说。
 
-> ⚠️ 本轮改的是**宿主半边**，所以**必须重启 DSH 才生效**（见 §6）。
-> 客户端那一半（`lib/client.js`）会随页面刷新更新，但**没有宿主的新数据面，
-> 页面就只是少了那些提示而已**——项目 skill 仍然出不来。
+> ⚠️ 改的是**宿主半边**时：`npm run build` **并且**重启 DSH 才生效（见 §6.5、§8）。
+> 客户端那一半（`src/client/index.ts` → `lib/client.js`）也**先要 build**，之后随页面刷新更新；
+> 但**没有宿主的新数据面，页面就只是少了那些提示而已**——项目 skill 仍然出不来。
 
 ---
 
@@ -402,9 +527,12 @@ skill 读回来。（`自定义` 那一格仍受上游影响，因为它指向�
 | 边界 | 说明 |
 |---|---|
 | **导航图标不可由插件提供** | 注册字段白名单里没有 `icon`，`navIcon(id)` 对未知 id 一律兜底成齿轮。本页因此显示齿轮。`dsh-mcp-manager` 用「给自己那一格打 data 属性 + CSS 覆盖」绕过去了，本插件**刻意不学**——那条路依赖官方 DOM 结构，官方一改就静默失效。若官方将来支持 `icon`，改用注册参数。 |
-| **未接 `ctx.locale`** | 官方 practices 要求用户可见文案走 Client locale 服务。本插件文案硬编码中文，与同目录的 `dsh-mcp-manager` 一致。这是一处**有意的偏离**。 |
-| 宿主半边不热重载 | `dsh-hmr` 只监听 DSH 安装目录与 profile 补丁文件；本仓库目录不在其中，且 Node 的 ESM 按 URL 缓存模块。改 `lib/index.js` 必须重启 DSH。 |
-| 客户端半边会热重载 | 但**只在 `pnpm run dev:web` 也在跑**时，client-plugin 变更才会免刷新生效；否则要刷新页面。 |
+| **未接 `ctx.locale`** | 官方 practices 要求用户可见文案走 Client locale 服务。本插件文案硬编码中文，与同目录的 `dsh-mcp-manager` 一致。这是一处**有意的偏离**。包里的 `locale/{en,zh}.json` 只喂 bundle 清单的 `meta.title` / `meta.description`，**不是** Client locale 服务。 |
+| 宿主半边不热重载 | `dsh-hmr` 只监听 DSH 安装目录与 profile 补丁文件；本仓库目录不在其中，且 Node 的 ESM 按 URL 缓存模块。改 `src/host/**` 后要 `npm run build` + 重启 DSH（被加载的是产物 `lib/index.js`）。 |
+| 客户端半边会热重载 | 改 `src/client/**` 同样**先要 `npm run build`**；之后**只在 `pnpm run dev:web` 也在跑**时，client-plugin 变更才会免刷新生效；否则要刷新页面。 |
+| **`lib/**` 是生成物** | 源码在 `src/**`。手改 `lib/**` 会被下一次 `npm run build` 覆盖，且 E 区的指纹断言与 CI 的 `git diff --exit-code -- lib` 都会红。 |
+| **手写行与 bundle 安装同 id 冲突** | 两条同 id 条目**不报错**，后插入者赢——表现是"装完看着毫无变化"。迁移顺序见 §6.3。 |
+| **bundle 未真装、包未发布** | 见 §6.7：没装进任何 profile，也没 `npm publish`。所有"装完就能用"的说法目前都是**推断**。 |
 | `order` 不保证"永远最后" | 910 只是大于 MCP 的 900。别的插件开更大就会排到后面。 |
 | 同 `(id, priority)` 冲突会抛错 | `id` 的唯一性约束在 `(id, priority)`；`order` 可以重复。所以 `id: "skills"` 不能与别的插件重名。 |
 | 无 session 时没有权威 cwd | 宿主没有「当前工作区」概念。此时 `cwd: undefined`，项目类 skill 可能少列——`resolvedBy` 会如实说明。 |
@@ -461,17 +589,31 @@ skill 读回来。（`自定义` 那一格仍受上游影响，因为它指向�
 ## 10. 常用命令
 
 ```powershell
-# 自检（唯一必跑）
-node tools/verify.mjs
+# 自检（唯一必跑；零依赖，不装 node_modules 也能跑 —— Node ≥22.18 原生类型擦除）
+node tools/verify.ts
 
 # 改动前先跑一次当基线：改动前 PASS、改动后 FAIL，才能证明是改动引起的
 
-# 编码检查（提交前）
-node -e "const fs=require('fs');const b=fs.readFileSync('lib/client.js');const t=b.toString('utf8');console.log((b[0]===0xEF?'BOM!':'no-bom'),(t.includes(String.fromCharCode(0xFFFD))?'FFFD!':'clean'),'crlf='+(t.match(/\r\n/g)||[]).length)"
+# src/** → lib/**（改了源码就必须跑，产物要一并提交）
+npm run build
+
+# 类型检查（含 tools/**）：tsc -b --clean && tsc -b && tsc -p tsconfig.tools.json
+npm run typecheck
+
+# 三步串起来，交付前跑这条
+npm run check
+
+# 产包审查（清单见 §6.6）
+npm pack
+
+# 编码检查（提交前；产物是生成的，也要查）
+node -e "const fs=require('fs');for (const p of ['src/host/index.ts','src/client/index.ts','lib/index.js','lib/client.js']) { const b=fs.readFileSync(p); const t=b.toString('utf8'); console.log(p, (b[0]===0xEF?'BOM!':'no-bom'), (t.includes(String.fromCharCode(0xFFFD))?'FFFD!':'clean'), 'crlf='+(t.match(/\r\n/g)||[]).length) }"
 ```
 
 > 从 app.asar 里取官方源码的偏移算法见 §9。**别用 `node -e` 写注入/替换脚本**：
-> PowerShell 会吃掉反引号，锚点静默变成 0 次命中——写成 `.mjs` 文件再跑（AGENTS.md §4.3）。
+> PowerShell 会吃掉反引号，锚点静默变成 0 次命中——写成独立脚本文件（`.mjs` / `.ts`）再跑。
+> 注入要打在 `src/**` 上、然后 `npm run build`：直接改 `lib/**` 会被 E 区指纹断言抓出来，
+> 于是分不清"注入没生效"还是"没重新构建"（AGENTS.md §4.3）。
 
 查活台账：
 

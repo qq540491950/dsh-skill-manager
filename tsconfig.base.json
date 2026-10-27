@@ -1,0 +1,26 @@
+// 共享编译选项。两个半边各自的 project 继承它，只覆盖 lib / types 这类真正不同的部分。
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "erasableSyntaxOnly": true,
+    // 相对 import **必须带扩展名**（`./types.ts`）。理由：自检脚本要直接跑 TypeScript 源码
+    // （Node ≥22.18 的类型擦除），而 Node 的 ESM 解析器不认无扩展名的相对路径。
+    // 显式扩展名对 tsc / esbuild / Node 三方都成立；产物里的 .d.ts 由
+    // rewriteRelativeImportExtensions 改写成 .js。
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true
+  }
+}

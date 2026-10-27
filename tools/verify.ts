@@ -1,5 +1,5 @@
 /**
- * 自检（`node tools/verify.mjs`）。零依赖，只用 Node 内置模块。
+ * 自检（`node tools/verify.ts`）。零依赖，只用 Node 内置模块。
  *
  * ## 为什么要有这个文件
  *
@@ -8,14 +8,22 @@
  * 发现的手段就是把它当成纯函数真跑一遍。客户端半边虽然会热重载，但"跑起来看看"
  * 兜不住回归——所以两条半边都在这里用替身真跑，包括**真实渲染**。
  *
+ * 另外两件事也只能在这里钉住：
+ *   - `lib/**` 是 `tools/build.ts` 的**产物**（E 区）：改了 `src/**` 忘了 build，产物与源码
+ *     就对不上，而 `lib/` 又是唯一被发布/加载的东西——这种漂移在运行期几乎看不出来。
+ *   - 这个包是一个**可发布的 DSH bundle**（P 区）：包清单、补丁层、locale、图标、files
+ *     白名单之间任何一处漂了，用户装上的就是一个"看不见/装不上"的插件。
+ *
  * ## 断言分区
  *
  * | 区 | 覆盖 |
  * |---|---|
  * | A | 静态护栏：包清单 / 座位注册形状 / 主题与 inline 纪律 / 零 import / 只读性 / 编码 |
+ * | E | **产物契约**：`lib/.build-manifest.json` 的指纹、src 覆盖率、产物 banner（构建新鲜度） |
+ * | P | **发布形态**：bundle 补丁行、locale、图标、files/exports/license/engines/peer、密钥扫描 |
  * | B | **宿主半边行为**：假 ctx 真跑 `apply`，真发 `Request`，断言作用域解析链、租约释放、分组、读取 |
  * | C | 客户端半边协议：假 `window.__ModuleLoader__` 真跑 factory，断言座位注册项与 require 面 |
- * | D | **真实渲染**：迷你渲染器递归展开函数组件（含 hooks 顺序计数），覆盖就绪/空/失败/不完整/降级/展开正文 |
+ * | D | **真实渲染**：迷你渲染器递归展开函数组件（含 hooks 顺序计数），覆盖就绪/空/失败/降级/展开正文 |
  *
  * ## 断言必须被怀疑
  *
@@ -23,35 +31,46 @@
  * 所以：静态检查先**剥掉注释**（曾把注释里的 API 名当成真实调用，写出永远误报的断言）；
  * 断言里的「或」分支必须逐条有意义（`a === undefined || b === c` 这种半真半假的写法
  * 等于没断言）。
+ *
+ * ## 静态护栏读的是**出厂产物**，不是 `src/**`
+ *
+ * A / E / P 区故意对着 `lib/index.js`、`lib/client.js`、`package.json`、`cordis.patch.yml`
+ * 这些**真正会发出去的东西**做文本断言。产物是 esbuild 输出，所以模式必须容忍它的形状：
+ *   1. 顶层 `const` 可能被改写成 `var`（打包器把模块级绑定降级）；
+ *   2. 字符串引号可能被规范成双引号（源码写 `'…'`、产物写 `"…"`）；
+ *   3. 数字字面量可能被改写成指数形式（`200_000` → `2e5`）。
+ * 护栏的**保护意图**不变，只是锚点跟着产物形状走。想验「源码长什么样」请另加断言，
+ * 不要把这几种模式改回去——它们钉的是"发出去的东西"。
  */
 
-import fs from 'node:fs'
-import path from 'node:path'
+import { createHash } from 'node:crypto'
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const readText = (rel) => fs.readFileSync(path.join(ROOT, rel), 'utf8')
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const readText = (rel: string): string => readFileSync(join(ROOT, rel), 'utf8')
 
 let passed = 0
-const failures = []
+const failures: string[] = []
 
 /**
- * @param id - 断言编号（A1 / B7 / C3 / D2…），失败时直接指出是哪一条。
+ * @param id - 断言编号（A1 / B7 / C3 / D2 / E1 / P3…），失败时直接指出是哪一条。
  * @param ok - 判定结果。
  * @param detail - 失败时打印的「实际是什么」，不含具体值就没法定位。
  */
-function check(id, ok, detail) {
+function check(id: string, ok: boolean, detail: string): void {
   if (ok === true) passed++
   else failures.push(`${id}: ${detail}`)
 }
 
 /** 剥掉块注释与行注释。静态检查必须跑在剥完的源码上（见文件头）。 */
-function stripComments(source) {
+function stripComments(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '')
 }
 
 /** 反复剥掉**最内层**的 `var(...)`，直到没有；用于判断颜色是不是只出现在 fallback 里。 */
-function stripVarCalls(source) {
+function stripVarCalls(source: string): string {
   let out = source
   for (let i = 0; i < 20; i++) {
     const next = out.replace(/var\([^()]*\)/g, '')
@@ -62,31 +81,333 @@ function stripVarCalls(source) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 类型契约（自检自己的类型）
+//
+// 这些类型**只服务自检**，不是产品契约（产品契约在 `src/shared/types.ts`）。
+// 两条原则：
+//   1. **假对象在边界上收窄一次**：假 ctx / 假 react / 假 fetch 的形状由测试作者决定，
+//      被测代码拿到的都是 `any`。所以只在**造夹具的那几行**做 `as`，内部逻辑照结构写。
+//   2. **响应体保持 `any`**：它是被测代码的输出，断言本身就是那道检查；再套一层类型
+//      只会把"字段缺了"变成类型错误，而不是一条可读的 FAIL 行（AGENTS §5.5）。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** `package.json` 里自检用到的字段（其它字段一律不关心）。 */
+interface PackageManifest {
+  name?: unknown
+  type?: unknown
+  main?: unknown
+  types?: unknown
+  exports?: Record<string, unknown>
+  icon?: unknown
+  files?: unknown
+  license?: unknown
+  publishConfig?: { access?: unknown }
+  engines?: Record<string, unknown>
+  peerDependencies?: Record<string, unknown>
+  dsh?: { manifestVersion?: unknown; bundle?: { patch?: unknown }; client?: { platform?: unknown } }
+}
+
+/** `lib/.build-manifest.json`（由 `tools/build.ts` 写出）。 */
+interface BuildManifestTarget {
+  output?: unknown
+  outputSha256?: unknown
+  inputs?: Record<string, unknown>
+}
+
+interface BuildManifest {
+  tool?: unknown
+  targets?: BuildManifestTarget[]
+}
+
+/** 宿主半边模块的导出面（产物 ESM）。`ctx` 在边界上是 `any`——这是假 ctx。 */
+interface HostPluginModule {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  apply: (ctx: any) => void
+  inject: unknown
+  name?: unknown
+}
+
+/** 一条 `SkillSummary` 夹具（字段与 `ctx.skills` 的 `toSummary` 对齐）。 */
+interface SkillFixture {
+  name: string
+  description: string
+  whenToUse: string
+  path: string
+  source: string
+  provider: string
+  invocation: { modelInvocable: boolean; userInvocable: boolean }
+  resourceBase: { kind: string; path: string }
+}
+
+/** 宿主传给注册表的查询选项（`snapshot` / `get` 的第二个参数）。 */
+interface RowQueryOptions {
+  scope?: unknown
+  cwd?: string
+  [key: string]: unknown
+}
+
+/** 直读用的目录表项。 */
+interface DirEntryFixture {
+  name: string
+  type: 'directory' | 'file'
+}
+
+/** 宿主替身收到的每一次调用（断言才有「实际发生了什么」可看）。 */
+interface HostCalls {
+  snapshot: RowQueryOptions[]
+  scopedSnapshot: RowQueryOptions[]
+  get: Array<{ name: string; options?: RowQueryOptions }>
+  scopedGet: Array<{ name: string; options?: RowQueryOptions }>
+  acquireScope: string[]
+  observeSession: Array<{ id: string; options?: unknown }>
+  serviceFor: Array<{ agent: unknown; name: string }>
+  lstat: unknown[]
+  resolve: string[]
+  listDir: string[]
+  stat: string[]
+  readText: string[]
+}
+
+/** 搭宿主替身时可调的旋钮。 */
+interface HostFixture {
+  skills?: SkillFixture[]
+  contents?: Record<string, string>
+  complete?: boolean
+  noPresets?: boolean
+  noSessionQuery?: boolean
+  existingPaths?: string[]
+  dirs?: Record<string, DirEntryFixture[]>
+  files?: Record<string, string>
+  unresolvable?: string[]
+  noFs?: boolean
+  fsThrows?: boolean
+}
+
+/** 注册到 `ctx.connection.fetch` 上的路由描述。 */
+interface RouteRegistration {
+  path?: string
+  methods?: string[]
+  requestBody?: string
+  fetch: (request: Request) => Promise<Response>
+}
+
+/** `ctx.fs` 的 target 形状（对齐 `dsh-fs-local`）。 */
+interface FsTarget {
+  targetKey: string
+  displayPath: string
+}
+
+interface LeaseStub {
+  key: { leaseKey: boolean }
+  disposed: number
+  [Symbol.asyncDispose]: () => Promise<void>
+}
+
+interface ObservationStub {
+  header: { cwd: string; agentPreset: string }
+  disposed: number
+  [Symbol.dispose]: () => void
+}
+
+interface LiveAgentStub {
+  id: string
+  ctx: { tag: string }
+  __scoped: unknown
+}
+
+interface HostFixtureHandle {
+  ctx: unknown
+  routes: RouteRegistration[]
+  calls: HostCalls
+  lease: LeaseStub
+  observation: ObservationStub
+  liveAgent: LiveAgentStub
+  scopedRegistry: unknown
+  skills: unknown
+  fs: unknown
+}
+
+/** `window.__ModuleLoader__.load({ id, factory })` 的 spec。 */
+interface ClientLoadSpec {
+  id?: string
+  factory: (require: (name: string) => unknown) => unknown
+}
+
+interface ClientModuleHandle {
+  loads: ClientLoadSpec[]
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  exportsObj: any
+  requireCalls: string[]
+}
+
+/** 座位注册项（官方 slot 白名单字段的一个子集）。 */
+interface SlotOptions {
+  name?: string
+  id?: string
+  order?: number
+  label?: () => string
+  icon?: unknown
+}
+
+interface SlotRegistration {
+  options: SlotOptions
+  component: unknown
+}
+
+interface ClientApplyHandle {
+  registrations: SlotRegistration[]
+  injected: string[]
+}
+
+/** 迷你 react 的 hook 位。一个函数组件实例 = 一组 hook 槽 + 每次渲染的位数记录。 */
+interface EffectRecord {
+  fn: () => unknown
+  deps?: unknown[]
+  pending: boolean
+  cleanup?: () => void
+}
+
+interface HookInstance {
+  hooks: unknown[]
+  effects: Array<EffectRecord | undefined>
+  callbacks: Array<{ fn: (...args: unknown[]) => unknown; deps?: unknown[] } | undefined>
+  index: number
+  history: number[]
+}
+
+interface RuntimeState {
+  current: HookInstance | null
+  dirty: boolean
+}
+
+interface Runtime {
+  react: any // eslint-disable-line @typescript-eslint/no-explicit-any -- 假 react 在边界上是 any
+  state: RuntimeState
+  instances: Map<string, HookInstance>
+}
+
+/** 展开后的渲染树。host 节点的 props 在边界上是 `any`（要直接取 onClick/onChange 调）。 */
+interface TextNode {
+  kind: 'text'
+  text: string
+}
+
+interface FragmentNode {
+  kind: 'frag'
+  children: RenderedNode[]
+}
+
+interface HostNode {
+  kind: 'host'
+  type: string
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  props: any
+  children: RenderedNode
+}
+
+type RenderedNode = TextNode | FragmentNode | HostNode | null
+
+/** 假响应 + 假 fetch。 */
+interface FakeResponse {
+  status: number
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  json: () => Promise<any>
+}
+
+interface FetchInit {
+  method?: string
+  body?: unknown
+  headers?: Record<string, string>
+  [key: string]: unknown
+}
+
+type FetchHandler = (url: string, init?: FetchInit) => Promise<FakeResponse> | FakeResponse
+
+interface FetchCall {
+  url: string
+  init?: FetchInit
+}
+
+/** D 区一次真实渲染的结果。 */
+interface RenderedSection {
+  runtime: Runtime
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  component: (props?: any) => any
+  props: Record<string, unknown>
+  fetchCalls: FetchCall[]
+  fetchHandler: FetchHandler
+  view: RenderedNode
+  text: string
+  hosts: HostNode[]
+}
+
+const globalSlots = globalThis as unknown as {
+  document?: unknown
+  fetch: (...args: any[]) => any // eslint-disable-line @typescript-eslint/no-explicit-any
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // A 区：静态护栏
 // ─────────────────────────────────────────────────────────────────────────────
 
-const hostSrc = readText('lib/index.js')
-const clientSrc = readText('lib/client.js')
-const pkg = JSON.parse(readText('package.json'))
+/**
+ * 读一个文件；读不到就返回空串。
+ *
+ * 「文件没了」要由**断言**报出来（一条干净的 `x A1: …`），而不是让整个自检在解引用处崩掉——
+ * 崩掉的输出里一条失败行都没有，反向验证时会被误判成"注入没生效"（AGENTS 5.5）。
+ */
+function readTextOrEmpty(rel: string): string {
+  return existsSync(join(ROOT, rel)) ? readText(rel) : ''
+}
+
+const hostSrc = readTextOrEmpty('lib/index.js')
+const clientSrc = readTextOrEmpty('lib/client.js')
+// package.json 解析失败同样不许崩：解析错误本身进 A0，后面的断言照常跑（会连带报出来）。
+let packageParseError = ''
+let pkg: PackageManifest
+try {
+  pkg = JSON.parse(readTextOrEmpty('package.json') || '{}') as PackageManifest
+} catch (error) {
+  packageParseError = String(error)
+  pkg = {} as PackageManifest
+}
 const hostCode = stripComments(hostSrc)
 const clientCode = stripComments(clientSrc)
 
-check('A1', pkg.name === 'dsh-skill-manager', `package.json name = ${JSON.stringify(pkg.name)}`)
+check(
+  'A0',
+  packageParseError === '' && typeof pkg.name === 'string' && pkg.name !== '',
+  `package.json 必须存在、是合法 JSON、且有 name 字段：${packageParseError === '' ? 'name 缺失' : packageParseError}`,
+)
+
+check('A1', pkg.name === '@qq540491950/dsh-skill-manager', `package.json name = ${JSON.stringify(pkg.name)}`)
 check('A2', pkg.type === 'module', `type = ${JSON.stringify(pkg.type)}`)
 check('A3', pkg.main === 'lib/index.js', `main = ${JSON.stringify(pkg.main)}`)
-check('A4', pkg.exports?.['.'] === './lib/index.js', `exports["."] = ${JSON.stringify(pkg.exports?.['.'])}`)
+// 契约变更（bundle 发布改造）：`exports["."]` 从字符串变成了条件对象 `{ types, default }`——
+// 运行时解析 `default`，类型解析 `types`。两条都必须存在且都指向 `lib/`。
+const rootExport = pkg.exports?.['.'] as { default?: unknown; types?: unknown } | undefined
+check(
+  'A4',
+  typeof rootExport === 'object' &&
+    rootExport !== null &&
+    rootExport.default === './lib/index.js' &&
+    typeof rootExport.types === 'string' &&
+    rootExport.types.startsWith('./lib/types/'),
+  `exports["."] = ${JSON.stringify(pkg.exports?.['.'])}，期望 { default: './lib/index.js', types: './lib/types/…' }`,
+)
 check('A5', pkg.exports?.['./client'] === './lib/client.js', `exports["./client"] = ${JSON.stringify(pkg.exports?.['./client'])}`)
 // 客户端 bundle 要被 dsh-client-modules 认出来，必须有 dsh.client.platform === 'web'。
 check('A6', pkg.dsh?.client?.platform === 'web', `dsh.client.platform = ${JSON.stringify(pkg.dsh?.client?.platform)}`)
 
 // factory 的 id 必须逐字等于包名，否则 dsh-client-modules 找不到这个模块。
-const loaderId = /__ModuleLoader__\.load\(\{\s*id:\s*"([^"]+)"/.exec(clientCode)?.[1]
+// 包名现在带 scope，但这里比的是 `pkg.name`，不是写死的字面量——意图不变。
+const loaderId = /__ModuleLoader__\.load\(\{\s*id:\s*["']([^"']+)["']/.exec(clientCode)?.[1]
 check('A7', loaderId === pkg.name, `__ModuleLoader__ id = ${JSON.stringify(loaderId)}，package name = ${JSON.stringify(pkg.name)}`)
 
 // 宿主半边零 import / 零 require：裸模块说明符都在 app.asar 里，从磁盘路径解析不到。
 check('A8', !/^\s*import\s/m.test(hostCode), 'lib/index.js 出现了 import 语句')
 check('A9', !/\brequire\s*\(/.test(hostCode), 'lib/index.js 出现了 require() 调用')
-check('A10', !/\bfrom\s+['"]/.test(hostCode), 'lib/index.js 出现了 from "..." 形式')
+check('A10', !/\bfrom\s+["']/.test(hostCode), 'lib/index.js 出现了 from "..." 形式')
 
 // 第一阶段只读：不得出现任何写入路径。
 for (const [id, needle] of [
@@ -100,11 +421,12 @@ for (const [id, needle] of [
 }
 
 // 宿主路由必须挂在 /api 之下（assertFetchRoute 的校验）。
-const routeLiteral = /const ROUTE = '([^']+)'/.exec(hostCode)?.[1]
+// 锚点更新：产物把顶层 `const` 降级成 `var`、引号规范成双引号，模式两端都容忍。
+const routeLiteral = /(?:const|let|var)\s+ROUTE\s*=\s*["']([^"']+)["']/.exec(hostCode)?.[1]
 check('A16', typeof routeLiteral === 'string' && routeLiteral.startsWith('/api/'), `ROUTE = ${JSON.stringify(routeLiteral)}`)
 // 客户端必须走**同源相对路径**：宿主路由挂在 webServer 的 /api 之下，
 // 同源请求自带浏览器鉴权，不需要（也不该）拼绝对地址或自建 token。
-const clientRoute = /const ROUTE = "([^"]+)"/.exec(clientCode)?.[1]
+const clientRoute = /(?:const|let|var)\s+ROUTE\s*=\s*["']([^"']+)["']/.exec(clientCode)?.[1]
 check('A33', typeof clientRoute === 'string' && clientRoute.startsWith('/'), `客户端 ROUTE = ${JSON.stringify(clientRoute)}，必须是同源相对路径`)
 
 // 客户端不得加载任何 Harness Client 包（官方 practices 明令禁止）。
@@ -113,16 +435,18 @@ check('A17', requires.length > 0 && requires.every((name) => name === 'react'), 
 check('A18', !/@deepseek-ai\//.test(clientCode), '客户端源码引用了 @deepseek-ai/ 包名')
 
 // 座位注册形状：list 座位必须有唯一 id；order 要排在 MCP 页（900）之后。
-const sectionId = /const SECTION_ID = "([^"]+)"/.exec(clientCode)?.[1]
+// 锚点更新：同上，`const` → `var`、引号规范化。
+const sectionId = /(?:const|let|var)\s+SECTION_ID\s*=\s*["']([^"']+)["']/.exec(clientCode)?.[1]
 const sectionOrder = Number(/order:\s*(\d+)/.exec(clientCode)?.[1])
-const sectionLabel = /const SECTION_LABEL = "([^"]+)"/.exec(clientCode)?.[1]
+const sectionLabel = /(?:const|let|var)\s+SECTION_LABEL\s*=\s*["']([^"']+)["']/.exec(clientCode)?.[1]
 check('A19', sectionId === 'skills', `SECTION_ID = ${JSON.stringify(sectionId)}`)
 check('A20', Number.isInteger(sectionOrder) && sectionOrder > 900, `order = ${sectionOrder}，必须 > 900（MCP 页占 900）`)
 check('A21', sectionLabel === 'Skills', `SECTION_LABEL = ${JSON.stringify(sectionLabel)}`)
-check('A22', /slots\.inject\(\s*"settings\.section"/.test(clientCode), '客户端没有通过 slots.inject("settings.section", …) 注册（直接 register 会因座位未声明而抛错）')
+check('A22', /slots\.inject\(\s*["']settings\.section["']/.test(clientCode), '客户端没有通过 slots.inject("settings.section", …) 注册（直接 register 会因座位未声明而抛错）')
 
 // 主题纪律：颜色只允许作为 var() 的 fallback，绝不能是裸色值。
-const css = /const CSS = `([\s\S]*?)`;/.exec(clientCode)?.[1] ?? ''
+// 锚点更新：`const CSS = \`…\`` → 产物里是 `var CSS = \`…\``。
+const css = /(?:const|let|var)\s+CSS\s*=\s*`([\s\S]*?)`/.exec(clientCode)?.[1] ?? ''
 check('A23', css !== '', '没找到注入的 CSS 常量')
 const bareColor = /#[0-9a-fA-F]{3,8}\b|\brgba?\(|\bhsla?\(/.exec(stripVarCalls(css))
 check('A24', bareColor === null, `CSS 里出现了裸色值 ${JSON.stringify(bareColor?.[0])}（硬编码颜色在深色主题下会白底白字；只允许写进 var() 的 fallback）`)
@@ -131,8 +455,10 @@ check('A25', css.includes('--dsw-alias-'), 'CSS 没有使用任何 --dsw-alias-*
 check('A26', !/\.(?!dskm-)[a-z][a-z0-9-]*\s*\{/.test(css), 'CSS 里有不带 dskm- 前缀的 class 选择器')
 
 // inline 样式只允许布局属性（视觉/尺寸写 inline 会压过样式表与 :hover）。
-const INLINE_ALLOWED = new Set(['display', 'gap', 'flex', 'flexWrap', 'alignItems', 'justifyContent', 'minWidth', 'maxWidth', 'minHeight', 'overflow', 'gridTemplateColumns'])
-const badInline = []
+// 注意：当前产物里**一个 inline style 都没有**（视觉全在 CSS 常量里），所以这条是
+// 「防止将来加 inline」的护栏——它可被打破：塞一个 `style:{color:'#fff'}` 立刻报错。
+const INLINE_ALLOWED = new Set<string>(['display', 'gap', 'flex', 'flexWrap', 'alignItems', 'justifyContent', 'minWidth', 'maxWidth', 'minHeight', 'overflow', 'gridTemplateColumns'])
+const badInline: string[] = []
 for (const match of clientCode.matchAll(/style:\s*\{([^}]*)\}/g)) {
   for (const prop of [...match[1].matchAll(/([A-Za-z][A-Za-z0-9]*)\s*:/g)].map((m) => m[1])) {
     if (!INLINE_ALLOWED.has(prop)) badInline.push(prop)
@@ -150,14 +476,26 @@ const noMin = flexBlocks
 check('A28', noMin.length === 0, `这些可收缩的 flex 容器没有显式 min-width:0：${JSON.stringify(noMin)}`)
 
 // 分组映射必须与官方 rank 表的 source 取值一致（少一个就会静默落进 other）。
-const hostGroups = /const GROUPS = \{([\s\S]*?)\}/.exec(hostCode)?.[1] ?? ''
+// 锚点更新：`const GROUPS = {` → 产物里是 `var GROUPS = {`。
+const hostGroups = /(?:const|let|var)\s+GROUPS\s*=\s*\{([\s\S]*?)\}/.exec(hostCode)?.[1] ?? ''
 for (const source of ['project-dsh', 'project-agents', 'user-dsh', 'user-agents', 'custom', 'bundled', 'runtime']) {
   check(`A29[${source}]`, hostGroups.includes(source), `GROUPS 缺少 source "${source}"`)
 }
 
-// 编码纪律。
-for (const rel of ['lib/index.js', 'lib/client.js', 'package.json', 'tools/verify.mjs']) {
-  const buf = fs.readFileSync(path.join(ROOT, rel))
+// 编码纪律。（锚点更新：自检脚本自己从 `tools/verify.mjs` 改成了 `tools/verify.ts`；
+// 源码 `src/**` 也一并查——真正发出去的是产物，但乱码的源头在源码，两边都要干净。）
+for (const rel of [
+  'lib/index.js',
+  'lib/client.js',
+  'src/host/index.ts',
+  'src/host/service-types.ts',
+  'src/client/index.ts',
+  'src/client/service-types.ts',
+  'src/shared/types.ts',
+  'package.json',
+  'tools/verify.ts',
+]) {
+  const buf = readFileSync(join(ROOT, rel))
   const text = buf.toString('utf8')
   check(`A30[${rel}]`, buf[0] !== 0xef, `${rel} 带 BOM`)
   check(`A31[${rel}]`, !text.includes('\uFFFD'), `${rel} 含替换字符 U+FFFD（编码已损坏）`)
@@ -165,11 +503,330 @@ for (const rel of ['lib/index.js', 'lib/client.js', 'package.json', 'tools/verif
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// E 区：产物契约 / 构建新鲜度
+//
+// `lib/**` 是 `tools/build.ts` 的产物，也是**唯一会被加载/发布的东西**。所以"改了 src
+// 忘了 build"不能靠自觉：构建脚本每次写 `lib/.build-manifest.json`，记录
+//   产物自己的 sha256 + 它依赖的每个 src 文件的 sha256。
+// 这里逐条对账，任何一处漂移都立刻 FAIL。
+// ─────────────────────────────────────────────────────────────────────────────
+
+const MANIFEST_REL = 'lib/.build-manifest.json'
+/** 文件的 sha256（十六进制）。 */
+const sha256Of = (rel: string): string => createHash('sha256').update(readFileSync(join(ROOT, rel))).digest('hex')
+
+let manifest: BuildManifest | undefined
+let manifestError = '文件不存在'
+if (existsSync(join(ROOT, MANIFEST_REL))) {
+  try {
+    const parsed = JSON.parse(readText(MANIFEST_REL)) as BuildManifest
+    if (Array.isArray(parsed?.targets)) {
+      manifest = parsed
+      manifestError = ''
+    } else {
+      manifestError = 'targets 不是数组'
+    }
+  } catch (error) {
+    manifestError = String(error)
+  }
+}
+const manifestTargets: BuildManifestTarget[] = manifest?.targets ?? []
+
+// E1 manifest 存在、是合法 JSON、targets 覆盖两个产物。
+{
+  const outputs = manifestTargets.map((target) => String(target.output))
+  const required = ['lib/index.js', 'lib/client.js']
+  check(
+    'E1',
+    manifest !== undefined && required.every((output) => outputs.includes(output)),
+    `lib/.build-manifest.json ${manifest === undefined ? `不可用（${manifestError}）` : `的 targets = ${JSON.stringify(outputs)}`}，必须覆盖 ${JSON.stringify(required)}`,
+  )
+}
+
+// E2 每个产物记录的 outputSha256 必须等于当前文件内容的 sha256（产物被手改/构建没跑都会红）。
+for (const target of manifestTargets) {
+  const output = String(target.output)
+  const recorded = typeof target.outputSha256 === 'string' ? target.outputSha256 : ''
+  const actual = existsSync(join(ROOT, output)) ? sha256Of(output) : ''
+  check(
+    `E2[${output}]`,
+    recorded !== '' && actual === recorded,
+    `产物指纹对不上：记录 ${JSON.stringify(recorded)}，实际 ${JSON.stringify(actual)}（产物被手改过，或构建没跑）`,
+  )
+}
+
+// E3 每个产物记录的**输入** sha256 必须等于当前 src 文件的 sha256（改了 src 忘了 build 会红）。
+for (const target of manifestTargets) {
+  const output = String(target.output)
+  const inputs = target.inputs ?? {}
+  const names = Object.keys(inputs)
+  check(`E3[${output}#covered]`, names.length > 0, `${output} 在 manifest 里没有任何输入文件记录`)
+  for (const input of names) {
+    const recorded = typeof inputs[input] === 'string' ? (inputs[input] as string) : ''
+    const actual = existsSync(join(ROOT, input)) ? sha256Of(input) : ''
+    check(
+      `E3[${output} <- ${input}]`,
+      recorded !== '' && actual === recorded,
+      `输入指纹对不上：记录 ${JSON.stringify(recorded)}，实际 ${JSON.stringify(actual)}（改了 src 忘了 build）`,
+    )
+  }
+}
+
+/** 递归列出目录下的文件，返回相对仓库根的 POSIX 路径（排序后）。 */
+function listFilesRecursive(dirAbs: string, prefix: string): string[] {
+  const out: string[] = []
+  if (!existsSync(dirAbs)) return out
+  for (const entry of readdirSync(dirAbs, { withFileTypes: true })) {
+    const rel = prefix === '' ? entry.name : `${prefix}/${entry.name}`
+    if (entry.isDirectory()) out.push(...listFilesRecursive(join(dirAbs, entry.name), rel))
+    else if (entry.isFile()) out.push(rel)
+  }
+  return out.sort()
+}
+
+// E4 每个 src 下的 .ts 文件都必须出现在**某个**产物目标的 inputs 里。
+// 这一条抓两类事故：新增了一个源文件但构建脚本没把它算进去（那部分改动永远不会进产物），
+// 以及把某个源文件从产物里"摘"出去。
+const declaredInputs = new Set<string>(manifestTargets.flatMap((target) => Object.keys(target.inputs ?? {})))
+const sourceFiles = listFilesRecursive(join(ROOT, 'src'), 'src').filter((rel) => rel.endsWith('.ts'))
+check('E4#src', sourceFiles.length > 0, 'src 下一个 .ts 文件都没有——产物指纹无从校验')
+for (const rel of sourceFiles) {
+  check(`E4[${rel}]`, declaredInputs.has(rel), `${rel} 没有被任何产物目标记录为输入（构建脚本漏算，或构建没跑）`)
+}
+
+// E5 两个产物都带 build.ts 的「不要直接编辑」banner —— 证明 lib/ 是生成的，不是手写的。
+for (const rel of ['lib/index.js', 'lib/client.js']) {
+  const head = (existsSync(join(ROOT, rel)) ? readText(rel) : '').slice(0, 800)
+  check(
+    `E5[${rel}]`,
+    head.includes('不要直接编辑') && head.includes('tools/build.ts'),
+    `${rel} 的头部没有 tools/build.ts 的「不要直接编辑」banner（产物丢了生成标记，或被手写覆盖）`,
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P 区：发布形态
+//
+// 这个包是要发到 registry 的 DSH bundle。清单里任何一处不对，用户装上的就是
+// "看不见 / 装不上 / 悄悄不生效"的插件——而且要等装完才发现。
+// ─────────────────────────────────────────────────────────────────────────────
+
+// P2 bundle 清单版本：`dsh.manifestVersion` 是安装器认"这一份 bundle 清单按第几代规则读"的字段。
+// 缺了它，新字段（icon / locale / 校验）在某些 DSH 版本上会被**静默忽略**——最容易漏的一条。
+check(
+  'P2',
+  pkg.dsh?.manifestVersion === 1,
+  `dsh.manifestVersion = ${JSON.stringify(pkg.dsh?.manifestVersion)}，必须是 1`,
+)
+
+// P1 `dsh.bundle.patch` 指向仓库里的补丁层，且文件真的在。
+const patchValue = typeof pkg.dsh?.bundle?.patch === 'string' ? pkg.dsh.bundle.patch : ''
+const patchRel = patchValue.replace(/^\.\//, '')
+check('P1', patchValue === './cordis.patch.yml' && existsSync(join(ROOT, patchRel)), `dsh.bundle.patch = ${JSON.stringify(pkg.dsh?.bundle?.patch)}，且 ./cordis.patch.yml 必须存在`)
+
+/**
+ * 极简补丁层行解析（不引 yaml 依赖）。
+ *
+ * 把它简化成「行块」：每个以 `- ` 开头的行开一个新块，后续同块的键值行挂上去。
+ * 这样既能判断插件行在哪个块里，也能判断它的缩进是否**深于** `insert:` 那一行。
+ */
+interface PatchRow {
+  indent: number
+  firstLine: string
+  lines: string[]
+}
+
+function parsePatchRows(text: string): PatchRow[] {
+  const rows: PatchRow[] = []
+  for (const rawLine of text.split('\n')) {
+    // 注释：`#` 之后全部丢弃（本文件里没有带 `#` 的字符串值，够用且不会误伤）。
+    const line = rawLine.replace(/#.*$/, '').replace(/\s+$/, '')
+    if (line.trim() === '') continue
+    const indent = line.length - line.trimStart().length
+    const trimmed = line.trim()
+    if (trimmed.startsWith('- ')) rows.push({ indent, firstLine: trimmed.slice(2).trim(), lines: [trimmed.slice(2).trim()] })
+    else if (rows.length > 0) rows[rows.length - 1].lines.push(trimmed)
+  }
+  return rows
+}
+
+/** 从一个键值行里取值并去掉包裹引号。 */
+function patchValueOf(lines: string[], key: string): string | undefined {
+  for (const line of lines) {
+    const match = new RegExp(`^${key}\\s*:\\s*(.+)$`).exec(line)
+    if (match !== null) return match[1].trim().replace(/^['"]|['"]$/g, '')
+  }
+  return undefined
+}
+
+const patchText = existsSync(join(ROOT, patchRel)) ? readText(patchRel) : ''
+const patchRows = parsePatchRows(patchText)
+const insertRow = patchRows.find((row) => /^insert\s*:/.test(row.firstLine))
+// 顶层的 `- id: X`（无 insert）= "覆写已存在条目"，目标不存在时会被丢弃 —— 插件根本不会出现。
+const topLevelOverride = patchRows.find((row) => row.indent === 0 && /^id\s*:/.test(row.firstLine))
+// 插件行：比 `insert:` 那一行**更深**的 `- id:` 块。
+const insertEntries = insertRow === undefined ? [] : patchRows.filter((row) => row.indent > insertRow.indent)
+const pluginRow = insertEntries.find((row) => /^id\s*:/.test(row.firstLine))
+const pluginRowId = pluginRow === undefined ? undefined : patchValueOf(pluginRow.lines, 'id')
+const pluginRowName = pluginRow === undefined ? undefined : patchValueOf(pluginRow.lines, 'name')
+
+// P3 插件行必须写在 `insert:` 之下（不能是顶层 `- id:` 覆写）。
+check(
+  'P3',
+  insertRow !== undefined && pluginRow !== undefined && topLevelOverride === undefined && (pluginRowId ?? '') !== '',
+  `cordis.patch.yml 的插件行必须写在 insert: 之下（不能是顶层 - id: 覆写）；实际 insert=${insertRow !== undefined}，insert 下的行 ${JSON.stringify(insertEntries.map((row) => row.firstLine))}，顶层覆写=${JSON.stringify(topLevelOverride?.firstLine)}`,
+)
+// P4 插件行的 `name` 必须等于包名（Loader 用 name 解析到本包）。
+check('P4', pluginRowName !== undefined && pluginRowName === pkg.name, `cordis.patch.yml 插件行 name = ${JSON.stringify(pluginRowName)}，必须等于 package.json name ${JSON.stringify(pkg.name)}`)
+
+// P5 locale 资源：两个语言文件都要能解析，且 meta.title / meta.description 非空。
+for (const rel of ['locale/en.json', 'locale/zh.json']) {
+  let meta: { title?: unknown; description?: unknown } | undefined
+  let errorText = ''
+  try {
+    const parsed = JSON.parse(readText(rel)) as { meta?: { title?: unknown; description?: unknown } }
+    meta = parsed?.meta
+  } catch (error) {
+    errorText = String(error)
+  }
+  const titleOk = typeof meta?.title === 'string' && meta.title.trim() !== ''
+  const descriptionOk = typeof meta?.description === 'string' && meta.description.trim() !== ''
+  check(
+    `P5[${rel}]`,
+    titleOk && descriptionOk,
+    `${rel} 必须存在、能解析为 JSON，且 meta.title / meta.description 都非空；实际 ${JSON.stringify(meta)}${errorText === '' ? '' : `（${errorText}）`}`,
+  )
+}
+
+// P6 图标：存在、在包内、不超过 256 KiB。
+const iconValue = typeof pkg.icon === 'string' ? pkg.icon : ''
+const iconRel = iconValue.replace(/^\.\//, '')
+const iconAbs = iconRel === '' ? '' : resolve(ROOT, iconRel)
+const iconInsidePackage = iconAbs !== '' && !relative(ROOT, iconAbs).startsWith('..') && !relative(ROOT, iconAbs).includes(':')
+const iconExists = iconAbs !== '' && existsSync(iconAbs) && statSync(iconAbs).isFile()
+const iconSize = iconExists ? statSync(iconAbs).size : -1
+check(
+  'P6[icon]',
+  iconRel !== '' && iconInsidePackage && iconExists && iconSize <= 256 * 1024,
+  `pkg.icon = ${JSON.stringify(pkg.icon)}：必须在包内、存在、且 ≤256 KiB；实际 inside=${iconInsidePackage} exists=${iconExists} size=${iconSize}`,
+)
+// P7 图标内容：是 SVG，且**没有任何外部引用**（发布包不能拉网络资源 / 内嵌位图）。
+const iconText = iconExists ? readText(iconRel) : ''
+const iconPrologue = /^\s*(?:<\?xml[^>]*\?>\s*)?(?:(?:<!--[\s\S]*?-->)\s*)*(?:<svg[\s>])/i.test(iconText)
+const iconExternalRef = /(?:xlink:href|\bhref)\s*=\s*["']\s*(?:https?:|\/\/|data:)|<image\b/i.exec(iconText)
+check(
+  'P7[icon]',
+  iconPrologue && iconExternalRef === null,
+  `图标必须是 <svg（可带 XML / 注释前导），且不许有外部引用：prologue=${iconPrologue}，命中 ${JSON.stringify(iconExternalRef?.[0])}`,
+)
+
+// P8 `files` 白名单必须覆盖会用到的东西。目录条目天然覆盖其下所有文件。
+const fileEntries = Array.isArray(pkg.files) ? (pkg.files as unknown[]).map(String) : []
+const normalizeEntry = (entry: string): string => entry.replace(/^\.\//, '').replace(/\\/g, '/').replace(/\/+$/, '')
+const entryCovers = (entry: string, target: string): boolean => {
+  const normalizedEntry = normalizeEntry(entry)
+  const normalizedTarget = normalizeEntry(target)
+  if (normalizedEntry === normalizedTarget) return true
+  const glob = /^([^/*]+)\/\*\.([A-Za-z0-9]+)$/.exec(normalizedEntry)
+  if (glob !== null) {
+    const rest = normalizedTarget.slice(glob[1].length + 1)
+    return normalizedTarget.startsWith(`${glob[1]}/`) && !rest.includes('/') && rest.endsWith(`.${glob[2]}`)
+  }
+  return normalizedTarget.startsWith(`${normalizedEntry}/`)
+}
+const requiredPublished = ['lib/index.js', 'lib/client.js', 'cordis.patch.yml', 'locale/en.json', 'locale/zh.json', iconRel, 'README.md', 'LICENSE'].filter((rel) => rel !== '')
+for (const target of requiredPublished) {
+  check(`P8[${target}]`, fileEntries.some((entry) => entryCovers(entry, target)), `files 必须覆盖 ${target}，实际 files = ${JSON.stringify(fileEntries)}`)
+}
+// P9 反过来：源码与工具**绝不能**进发布包（会把 src/**、docs/ 与 .tsbuildinfo 一起发出去）。
+const forbiddenEntries = fileEntries.filter((entry) => {
+  const normalized = normalizeEntry(entry)
+  const top = normalized.split('/')[0]
+  return top === 'src' || top === 'tools' || top === 'docs' || normalized.includes('.tsbuildinfo')
+})
+check('P9', forbiddenEntries.length === 0, `files 里出现了不该发布的条目 ${JSON.stringify(forbiddenEntries)}（src / tools / docs / .tsbuildinfo）`)
+
+// P10 exports 必须把补丁层、locale 与 package.json 暴露出来（下游靠它们解析包内资源）。
+for (const key of ['./cordis.patch.yml', './locale/*.json', './package.json']) {
+  check(`P10[${key}]`, pkg.exports?.[key] !== undefined, `exports 缺少 ${key}，实际 keys = ${JSON.stringify(Object.keys(pkg.exports ?? {}))}`)
+}
+
+// P11 许可证：`license` 字段 + 真的 LICENSE 文件（registry 与 bundle 卡片都会读）。
+check(
+  'P11',
+  typeof pkg.license === 'string' && pkg.license.trim() !== '' && existsSync(join(ROOT, 'LICENSE')),
+  `license = ${JSON.stringify(pkg.license)}，且仓库根必须有 LICENSE 文件`,
+)
+// P12 公开发布：scoped 包默认私有，必须显式 public，否则 `npm publish` 直接失败。
+check('P12', pkg.publishConfig?.access === 'public', `publishConfig.access = ${JSON.stringify(pkg.publishConfig?.access)}，必须是 "public"`)
+// P13 engines：node 决定"能不能跑这个自检/构建"，dsh 决定"能不能被这个 runtime 装"。
+const engines = pkg.engines ?? {}
+check(
+  'P13',
+  typeof engines.node === 'string' && engines.node.trim() !== '' && typeof engines.dsh === 'string' && engines.dsh.trim() !== '',
+  `engines 必须同时声明 node 与 dsh，实际 ${JSON.stringify(engines)}`,
+)
+// P14 peer 只允许基座 `@deepseek-ai/cordis`：
+// 声明一个 `@deepseek-ai/dsh*` peer 等于给每次 DSH 升级都加一道 peer 闸门（装不上就报错）。
+const peerNames = Object.keys(pkg.peerDependencies ?? {})
+check(
+  'P14',
+  peerNames.length === 1 && peerNames[0] === '@deepseek-ai/cordis',
+  `peerDependencies = ${JSON.stringify(peerNames)}，只允许 ["@deepseek-ai/cordis"]`,
+)
+
+// P15 密钥扫描：只扫**会发出去的那批文件**（仓库里有 src/tools，但它们不进发布包）。
+/** 把 files 白名单展开成具体文件清单（目录递归展开，只支持 `dir/*.ext` 这一种通配）。 */
+function expandPublishList(entries: string[]): string[] {
+  const out = new Set<string>()
+  const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  for (const entry of entries) {
+    const normalized = normalizeEntry(entry)
+    if (normalized.includes('*')) {
+      const slash = normalized.lastIndexOf('/')
+      const dir = slash < 0 ? '' : normalized.slice(0, slash)
+      const pattern = normalized.slice(slash + 1)
+      const matcher = new RegExp(`^${pattern.split('*').map(escapeRegExp).join('[^/]*')}$`)
+      const dirAbs = join(ROOT, dir)
+      if (!existsSync(dirAbs)) continue
+      for (const dirent of readdirSync(dirAbs, { withFileTypes: true })) {
+        if (dirent.isFile() && matcher.test(dirent.name)) out.add(dir === '' ? dirent.name : `${dir}/${dirent.name}`)
+      }
+      continue
+    }
+    const abs = join(ROOT, normalized)
+    if (!existsSync(abs)) continue
+    if (statSync(abs).isDirectory()) for (const rel of listFilesRecursive(abs, normalized)) out.add(rel)
+    else out.add(normalized)
+  }
+  // npm 无条件带上这几个（就算不在 files 里）。
+  for (const extra of ['package.json', 'README.md', 'LICENSE']) if (existsSync(join(ROOT, extra))) out.add(extra)
+  return [...out].sort()
+}
+
+const publishedFiles = expandPublishList(fileEntries)
+const SECRET_PATTERNS: Array<[string, RegExp]> = [
+  ['context7 key（ctx7sk-）', /ctx7sk-/],
+  ['tavily key（tvly-）', /tvly-/],
+  ['JWT（eyJ…）', /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/],
+  ['Bearer <token>', /Bearer\s+[A-Za-z0-9._~+/-]{20,}/i],
+]
+const BINARY_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.woff', '.woff2', '.ttf', '.zip']
+check('P15#scan', publishedFiles.length > 0, `发布文件清单为空（files = ${JSON.stringify(fileEntries)}），密钥扫描等于没做`)
+for (const rel of publishedFiles) {
+  if (BINARY_EXTENSIONS.some((ext) => rel.toLowerCase().endsWith(ext))) continue
+  const text = readText(rel)
+  const hits = SECRET_PATTERNS.filter(([, pattern]) => pattern.test(text)).map(([label]) => label)
+  // 注意：只报"哪一种密钥"，不回显命中的原文。
+  check(`P15[${rel}]`, hits.length === 0, `${rel} 命中疑似密钥 ${JSON.stringify(hits)}（发布包不得包含任何真实 token / API key）`)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // B 区：宿主半边行为（假 ctx 真跑）
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** 造一条 `SkillSummary` 夹具（字段与 `ctx.skills` 的 `toSummary` 对齐）。 */
-function skill(name, source, invocation = { modelInvocable: true, userInvocable: true }) {
+function skill(name: string, source: string, invocation: { modelInvocable: boolean; userInvocable: boolean } = { modelInvocable: true, userInvocable: true }): SkillFixture {
   return {
     name,
     description: `${name} 的描述`,
@@ -182,7 +839,7 @@ function skill(name, source, invocation = { modelInvocable: true, userInvocable:
   }
 }
 
-const SKILLSET = [
+const SKILLSET: SkillFixture[] = [
   skill('alpha', 'project-dsh'),
   skill('beta', 'project-agents'),
   skill('gamma', 'user-dsh'),
@@ -193,8 +850,8 @@ const SKILLSET = [
 ]
 
 /** 临时改环境变量并跑一段异步逻辑。根目录路径由 env 决定，测试必须自己控制。 */
-async function withEnv(vars, run) {
-  const saved = new Map()
+async function withEnv<T>(vars: Record<string, string | undefined>, run: () => Promise<T>): Promise<T> {
+  const saved = new Map<string, string | undefined>()
   for (const [key, value] of Object.entries(vars)) {
     saved.set(key, process.env[key])
     if (value === undefined) delete process.env[key]
@@ -211,8 +868,8 @@ async function withEnv(vars, run) {
 }
 
 /** 搭一套宿主替身；每个成员都记录自己的调用，断言才有「实际发生了什么」可看。 */
-function makeHost(options = {}) {
-  const calls = {
+function makeHost(options: HostFixture = {}): HostFixtureHandle {
+  const calls: HostCalls = {
     snapshot: [],
     scopedSnapshot: [],
     get: [],
@@ -230,12 +887,12 @@ function makeHost(options = {}) {
   const contents = options.contents ?? {}
 
   /** 两个注册表（全局的 / preset 组内的）行为一致，只是记账通道不同。 */
-  const registry = (recordSnapshot, recordGet) => ({
-    async snapshot(o) {
+  const registry = (recordSnapshot: (options: RowQueryOptions) => void, recordGet: (name: string, options: RowQueryOptions) => void) => ({
+    async snapshot(o: RowQueryOptions) {
       recordSnapshot(o)
       return { skills: options.skills ?? SKILLSET, complete: options.complete ?? true }
     },
-    async get(name, o) {
+    async get(name: string, o: RowQueryOptions) {
       recordGet(name, o)
       const found = fixtures.find((item) => item.name === name)
       if (found === undefined) return undefined
@@ -243,14 +900,14 @@ function makeHost(options = {}) {
     },
   })
 
-  const lease = {
+  const lease: LeaseStub = {
     key: { leaseKey: true },
     disposed: 0,
     async [Symbol.asyncDispose]() {
       this.disposed++
     },
   }
-  const observation = {
+  const observation: ObservationStub = {
     header: { cwd: 'D:/project/demo', agentPreset: 'preset-cordis' },
     disposed: 0,
     [Symbol.dispose]() {
@@ -261,7 +918,7 @@ function makeHost(options = {}) {
     (o) => calls.scopedSnapshot.push(o),
     (name, o) => calls.scopedGet.push({ name, options: o }),
   )
-  const liveAgent = { id: 'session-live', ctx: { tag: 'agent-ctx' }, __scoped: scopedRegistry }
+  const liveAgent: LiveAgentStub = { id: 'session-live', ctx: { tag: 'agent-ctx' }, __scoped: scopedRegistry }
   const skills = registry(
     (o) => calls.snapshot.push(o),
     (name, o) => calls.get.push({ name, options: o }),
@@ -277,11 +934,11 @@ function makeHost(options = {}) {
           async remoteExportList() {
             return { presets: [{ id: 'preset-standard', isDefault: true }] }
           },
-          async acquireScope(id) {
+          async acquireScope(id: string) {
             calls.acquireScope.push(id)
             return lease
           },
-          serviceFor(agent, name) {
+          serviceFor(agent: LiveAgentStub, name: string) {
             calls.serviceFor.push({ agent, name })
             return agent.__scoped
           },
@@ -291,7 +948,7 @@ function makeHost(options = {}) {
         }
 
   const agents = {
-    get(id) {
+    get(id: string) {
       return id === liveAgent.id ? liveAgent : undefined
     },
   }
@@ -300,13 +957,13 @@ function makeHost(options = {}) {
     options.noSessionQuery === true
       ? undefined
       : {
-          async observeSession(id, o) {
+          async observeSession(id: string, o: unknown) {
             calls.observeSession.push({ id, options: o })
             return observation
           },
         }
 
-  const routes = []
+  const routes: RouteRegistration[] = []
   const existingPaths = options.existingPaths ?? []
   /** 直读路径用的目录表：`目录路径 → [{ name, type }]`。没登记 = 这个根不存在。 */
   const dirs = options.dirs ?? {}
@@ -325,48 +982,50 @@ function makeHost(options = {}) {
    * 而 `scanRoot` 必须把它降级成「这个根没有候选」，而不是把整页带下去。
    * `noFs` 时整个服务缺席（直读与存在性探测都应优雅降级）。
    */
-  const fs = options.noFs === true
-    ? undefined
-    : {
-        async lstat(target) {
-          calls.lstat.push(target)
-          if (options.fsThrows === true) throw new Error('sandbox denied')
-          return existingPaths.includes(target) ? { isDirectory: true } : undefined
-        },
-        async resolve(path) {
-          calls.resolve.push(path)
-          if (unresolvable.includes(path)) throw new Error(`cannot resolve ${path}`)
-          return { targetKey: path, displayPath: path }
-        },
-        async listDir(target) {
-          calls.listDir.push(target.displayPath)
-          const entries = dirs[target.displayPath]
-          if (entries === undefined) throw new Error(`cannot list ${target.displayPath}`)
-          return entries.map((entry) => ({
-            name: entry.name,
-            type: entry.type,
-            target: { targetKey: `${target.displayPath}/${entry.name}`, displayPath: `${target.displayPath}/${entry.name}` },
-          }))
-        },
-        async stat(target) {
-          calls.stat.push(target.displayPath)
-          return files[target.displayPath] === undefined ? undefined : { type: 'file' }
-        },
-        async readText(target) {
-          calls.readText.push(target.displayPath)
-          const text = files[target.displayPath]
-          if (text === undefined) throw new Error(`cannot read ${target.displayPath}`)
-          return text
-        },
-      }
+  const fs =
+    options.noFs === true
+      ? undefined
+      : {
+          async lstat(target: unknown) {
+            calls.lstat.push(target)
+            if (options.fsThrows === true) throw new Error('sandbox denied')
+            return existingPaths.includes(String(target)) ? { isDirectory: true } : undefined
+          },
+          async resolve(path: string) {
+            calls.resolve.push(path)
+            if (unresolvable.includes(path)) throw new Error(`cannot resolve ${path}`)
+            return { targetKey: path, displayPath: path }
+          },
+          async listDir(target: FsTarget) {
+            calls.listDir.push(target.displayPath)
+            const entries = dirs[target.displayPath]
+            if (entries === undefined) throw new Error(`cannot list ${target.displayPath}`)
+            return entries.map((entry) => ({
+              name: entry.name,
+              type: entry.type,
+              target: { targetKey: `${target.displayPath}/${entry.name}`, displayPath: `${target.displayPath}/${entry.name}` },
+            }))
+          },
+          async stat(target: FsTarget) {
+            calls.stat.push(target.displayPath)
+            return files[target.displayPath] === undefined ? undefined : { type: 'file' }
+          },
+          async readText(target: FsTarget) {
+            calls.readText.push(target.displayPath)
+            const text = files[target.displayPath]
+            if (text === undefined) throw new Error(`cannot read ${target.displayPath}`)
+            return text
+          },
+        }
+  const services: Record<string, unknown> = { agentPresets: presets, agents, sessionQuery, workspaceRegistry: undefined, fs }
   const scope = {
     skills,
-    get(name) {
-      return { agentPresets: presets, agents, sessionQuery, workspaceRegistry: undefined, fs }[name]
+    get(name: string): unknown {
+      return services[name]
     },
     connection: {
       fetch: {
-        register(route) {
+        register(route: RouteRegistration) {
           routes.push(route)
           return () => {}
         },
@@ -374,21 +1033,23 @@ function makeHost(options = {}) {
     },
   }
   const ctx = {
-    inject(names, cb) {
-      cb(scope)
+    inject(names: unknown, callback: (received: unknown) => void): void {
+      callback(scope)
     },
-    get: scope.get,
+    get(name: string): unknown {
+      return services[name]
+    },
   }
   return { ctx, routes, calls, lease, observation, liveAgent, scopedRegistry, skills, fs }
 }
 
-const hostModule = await import(new URL('../lib/index.js', import.meta.url).href)
+const hostModule = (await import(new URL('../lib/index.js', import.meta.url).href)) as HostPluginModule
 
 check('B0', typeof hostModule.apply === 'function', 'lib/index.js 没有导出 apply')
 check('B0b', Array.isArray(hostModule.inject), 'lib/index.js 没有导出 inject 数组')
 
-const GET = (query = '') => new Request(`http://127.0.0.1/api/skill-manager${query}`, { method: 'GET' })
-const POST = (payload) =>
+const GET = (query = ''): Request => new Request(`http://127.0.0.1/api/skill-manager${query}`, { method: 'GET' })
+const POST = (payload: unknown): Request =>
   new Request('http://127.0.0.1/api/skill-manager', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -406,9 +1067,9 @@ const POST = (payload) =>
  * 补默认值不会掩盖回归：`skills` / `roots` / `complete` 各自都有**专门的**断言
  * （B24 / B38 / B54），字段一缺就是一条干净的失败。
  */
-async function getJson(host, query = '') {
+async function getJson(host: HostFixtureHandle, query = ''): Promise<{ status: number; body: any }> {
   const response = await host.routes[0].fetch(GET(query))
-  const body = await response.json()
+  const body: any = await response.json()
   if (body !== null && typeof body === 'object' && body.data === undefined) {
     body.data = { skills: [], counts: {}, providers: {}, roots: [], complete: false }
   }
@@ -466,8 +1127,8 @@ check('B23', bareResult.status === 200, `降级时仍应 200，实际 ${bareResu
 const fixtureHost = makeHost()
 hostModule.apply(fixtureHost.ctx)
 const fixtureResult = await getJson(fixtureHost)
-const data = fixtureResult.body.data
-const byName = Object.fromEntries(data.skills.map((item) => [item.name, item]))
+const data: any = fixtureResult.body.data
+const byName = Object.fromEntries(data.skills.map((item: any) => [item.name, item]))
 check('B24', data.skills.length === SKILLSET.length, `返回 ${data.skills.length} 条，期望 ${SKILLSET.length}`)
 check('B25', byName.alpha?.group === 'project', `alpha.group = ${JSON.stringify(byName.alpha?.group)}`)
 check('B26', byName.beta?.group === 'project', `beta.group = ${JSON.stringify(byName.beta?.group)}`)
@@ -503,7 +1164,7 @@ check('B41', partialResult.body.data.complete === false, 'complete:false 没有�
 const readHost = makeHost({ skills: [skill('alpha', 'project-dsh')] })
 hostModule.apply(readHost.ctx)
 const readResponse = await readHost.routes[0].fetch(POST({ op: 'read', name: 'alpha', sessionId: 'session-live' }))
-const readBody = await readResponse.json()
+const readBody: any = await readResponse.json()
 check('B42', readResponse.status === 200 && readBody.ok === true, `read 失败：${JSON.stringify(readBody)}`)
 check('B43', readBody.data.content.includes('正文内容'), `content = ${JSON.stringify(readBody.data.content)}`)
 check('B44', readBody.data.truncated === false, `truncated = ${JSON.stringify(readBody.data.truncated)}`)
@@ -515,7 +1176,7 @@ check('B46', readHost.calls.scopedGet[0]?.options?.cwd === 'D:/project/demo', `r
 const missingHost = makeHost()
 hostModule.apply(missingHost.ctx)
 const missingResponse = await missingHost.routes[0].fetch(POST({ op: 'read', name: 'nope' }))
-const missingBody = await missingResponse.json()
+const missingBody: any = await missingResponse.json()
 check('B47', missingResponse.status === 409 && missingBody.ok === false, `找不到时应 409 + ok:false，实际 ${missingResponse.status}`)
 check('B48', String(missingBody.error).includes('nope'), `错误原文应点名那个 skill，实际 ${JSON.stringify(missingBody.error)}`)
 
@@ -527,7 +1188,7 @@ const bigContent = 'x'.repeat(200_000 + 10)
 const bigHost = makeHost({ skills: [skill('big', 'user-dsh')], contents: { big: bigContent } })
 hostModule.apply(bigHost.ctx)
 const bigResponse = await bigHost.routes[0].fetch(POST({ op: 'read', name: 'big' }))
-const bigBody = await bigResponse.json()
+const bigBody: any = await bigResponse.json()
 check('B50', bigBody.data.truncated === true, '超长正文没有标记 truncated')
 check('B51', bigBody.data.content.length === 200_000, `截断长度 = ${bigBody.data.content.length}，期望 200000`)
 check('B52', bigBody.data.contentLength === bigContent.length, `contentLength = ${bigBody.data.contentLength}`)
@@ -535,15 +1196,14 @@ check('B52', bigBody.data.contentLength === bigContent.length, `contentLength = 
 // —— 规范根目录探测：让「0 个」可解释（第一次实测暴露的直接问题）——
 // 必须带 sessionId：项目根是从 session 的权威 cwd 往上找 `.git` 得来的，
 // 没有 session 就没有 cwd，也就没有项目根（见下面的 B66）。
-const rootsOptions = { existingPaths: ['D:/project/.git', 'C:/dsh/skills'] }
+const rootsOptions: HostFixture = { existingPaths: ['D:/project/.git', 'C:/dsh/skills'] }
 const rootsHost = makeHost(rootsOptions)
 hostModule.apply(rootsHost.ctx)
-const rootsResult = await withEnv(
-  { DSH_HOME: 'C:/dsh', DSH_AGENTS_HOME: 'C:/agents', USERPROFILE: 'C:/home' },
-  () => getJson(rootsHost, '?sessionId=session-live'),
+const rootsResult = await withEnv({ DSH_HOME: 'C:/dsh', DSH_AGENTS_HOME: 'C:/agents', USERPROFILE: 'C:/home' }, () =>
+  getJson(rootsHost, '?sessionId=session-live'),
 )
-const rootsData = rootsResult.body.data
-const rootBySource = Object.fromEntries((rootsData.roots ?? []).map((root) => [root.source, root]))
+const rootsData: any = rootsResult.body.data
+const rootBySource = Object.fromEntries((rootsData.roots ?? []).map((root: any) => [root.source, root]))
 check('B53', rootsData.projectRoot === 'D:/project', `projectRoot = ${JSON.stringify(rootsData.projectRoot)}（应从 cwd 向上找到含 .git 的祖先）`)
 check('B54', Array.isArray(rootsData.roots) && rootsData.roots.length === 6, `roots 条数 = ${rootsData.roots?.length}，期望 6`)
 check('B55', rootBySource['project-dsh']?.path === 'D:/project/.dsh/skills', `project-dsh path = ${JSON.stringify(rootBySource['project-dsh']?.path)}`)
@@ -561,18 +1221,17 @@ check('B63', rootsData.providers?.filesystem === SKILLSET.length, `providers = $
 const noCwdHost = makeHost(rootsOptions)
 hostModule.apply(noCwdHost.ctx)
 const noCwdResult = await withEnv({ DSH_HOME: 'C:/dsh', USERPROFILE: 'C:/home' }, () => getJson(noCwdHost))
-const noCwdRoot = Object.fromEntries((noCwdResult.body.data.roots ?? []).map((root) => [root.source, root]))
+const noCwdRoot = Object.fromEntries((noCwdResult.body.data.roots ?? []).map((root: any) => [root.source, root]))
 check('B66', noCwdResult.body.data.projectRoot === undefined, `无 cwd 时 projectRoot = ${JSON.stringify(noCwdResult.body.data.projectRoot)}，应如实为 undefined`)
 check('B67', noCwdRoot['project-dsh']?.path === undefined, '无 cwd 时项目根路径不应编造')
 
 // 没有 fs 服务时必须是「未判定」，不能报成「不存在」——把权限/能力问题说成"你没装"是误报。
 const noFsHost = makeHost({ ...rootsOptions, noFs: true })
 hostModule.apply(noFsHost.ctx)
-const noFsResult = await withEnv(
-  { DSH_HOME: 'C:/dsh', DSH_AGENTS_HOME: 'C:/agents', USERPROFILE: 'C:/home' },
-  () => getJson(noFsHost, '?sessionId=session-live'),
+const noFsResult = await withEnv({ DSH_HOME: 'C:/dsh', DSH_AGENTS_HOME: 'C:/agents', USERPROFILE: 'C:/home' }, () =>
+  getJson(noFsHost, '?sessionId=session-live'),
 )
-const noFsRoot = Object.fromEntries((noFsResult.body.data.roots ?? []).map((root) => [root.source, root]))['project-dsh']
+const noFsRoot = Object.fromEntries((noFsResult.body.data.roots ?? []).map((root: any) => [root.source, root]))['project-dsh']
 check('B64', noFsRoot?.exists === undefined, `没有 fs 服务时 exists = ${JSON.stringify(noFsRoot?.exists)}，应为 undefined（未判定）`)
 
 // 根目录探测失败绝不能把整次目录读取带下去。
@@ -584,8 +1243,8 @@ hostModule.apply(fsThrowsHost.ctx)
 const fsThrowsResult = await withEnv({ DSH_HOME: 'C:/dsh', DSH_AGENTS_HOME: 'C:/agents', USERPROFILE: 'C:/home' }, () =>
   getJson(fsThrowsHost, '?sessionId=session-live'),
 )
-const fsThrowsData = fsThrowsResult.body.data
-const fsThrowsRoot = Object.fromEntries((fsThrowsData.roots ?? []).map((root) => [root.source, root]))
+const fsThrowsData: any = fsThrowsResult.body.data
+const fsThrowsRoot = Object.fromEntries((fsThrowsData.roots ?? []).map((root: any) => [root.source, root]))
 check('B65', fsThrowsResult.status === 200 && fsThrowsData.skills.length === SKILLSET.length, 'fs 抛错时目录读取仍应成功返回')
 check('B68', fsThrowsData.roots?.length === 6, `fs 抛错时 roots 条数 = ${fsThrowsData.roots?.length}，仍应给出 6 条（存在性降级为未判定，而不是整块消失）`)
 check('B69', fsThrowsRoot['project-dsh']?.exists === undefined, `fs 抛错时 exists = ${JSON.stringify(fsThrowsRoot['project-dsh']?.exists)}，应为 undefined（未判定）`)
@@ -606,8 +1265,7 @@ const AGENTS_HOME_ROOT = 'C:/agents/skills'
 const DSH_HOME_ROOT = 'C:/dsh/skills'
 
 /** 造一份 `SKILL.md`。 */
-const md = (name, description, extra = '') =>
-  `---\nname: ${name}\ndescription: ${description}\n${extra}---\n\n正文\n`
+const md = (name: string, description: string, extra = ''): string => `---\nname: ${name}\ndescription: ${description}\n${extra}---\n\n正文\n`
 
 const scanHost = makeHost({
   // 让项目根解析得到：官方与直读都靠「最近的含 .git 祖先」。
@@ -628,7 +1286,10 @@ const scanHost = makeHost({
     ],
     [AGENTS_HOME_ROOT]: [{ name: 'global-one', type: 'directory' }],
     // `.system` 是 `<dshHome>/skills` 独有的保留目录（官方 `skipSystem` 只挂在这个根上）。
-    [DSH_HOME_ROOT]: [{ name: '.system', type: 'directory' }, { name: 'dsh-one', type: 'directory' }],
+    [DSH_HOME_ROOT]: [
+      { name: '.system', type: 'directory' },
+      { name: 'dsh-one', type: 'directory' },
+    ],
   },
   files: {
     [`${PROJECT_AGENTS_ROOT}/git-commit/SKILL.md`]: md('git-commit', '提交代码'),
@@ -649,12 +1310,12 @@ hostModule.apply(scanHost.ctx)
 const scanResult = await withEnv({ DSH_HOME: 'C:/dsh', DSH_AGENTS_HOME: 'C:/agents' }, () =>
   getJson(scanHost, `?sessionId=session-live&cwd=${encodeURIComponent(PROJECT_ROOT)}`),
 )
-const scanData = scanResult.body.data
-const scanByName = Object.fromEntries(scanData.skills.map((row) => [row.name, row]))
+const scanData: any = scanResult.body.data
+const scanByName = Object.fromEntries(scanData.skills.map((row: any) => [row.name, row]))
 
 check('B70', scanResult.status === 200 && scanResult.body.ok === true, `直读用例的 GET 失败：${JSON.stringify(scanResult.body).slice(0, 200)}`)
 // 这一条就是用户报的那个 bug：注册表给不出项目 skill，直读必须补上。
-check('B71', scanByName['git-commit'] !== undefined, `项目 skill 没被直读补进来，实际 = ${JSON.stringify(scanData.skills.map((r) => r.name))}`)
+check('B71', scanByName['git-commit'] !== undefined, `项目 skill 没被直读补进来，实际 = ${JSON.stringify(scanData.skills.map((r: any) => r.name))}`)
 check('B72', scanByName['git-commit']?.group === 'project', `git-commit.group = ${JSON.stringify(scanByName['git-commit']?.group)}，应落进「项目」`)
 check('B73', scanByName['git-commit']?.source === 'project-agents', `source = ${JSON.stringify(scanByName['git-commit']?.source)}（必须与官方 rank 表一致，否则分组会漂）`)
 check('B74', scanByName['git-commit']?.path === `${PROJECT_AGENTS_ROOT}/git-commit/SKILL.md`, `path = ${JSON.stringify(scanByName['git-commit']?.path)}`)
@@ -674,19 +1335,19 @@ check('B79', scanByName['office-docx']?.group === 'bundled', '注册表原有的
 check(
   'B80',
   ['no-frontmatter', 'Bad_Name', 'no-description', 'legacy-keys', 'system-skill'].every((name) => scanByName[name] === undefined),
-  `不合法的文件被列出来了：${JSON.stringify(scanData.skills.map((r) => r.name))}`,
+  `不合法的文件被列出来了：${JSON.stringify(scanData.skills.map((r: any) => r.name))}`,
 )
 check('B81', scanByName['notes.txt'] === undefined, '非 .md 的文件不该被当成 skill')
 // 排序：官方按名字码点排序，合并后必须重排，顺序不能取决于哪个来源先到。
 check(
   'B82',
-  JSON.stringify(scanData.skills.map((row) => row.name)) === JSON.stringify([...scanData.skills.map((row) => row.name)].sort()),
-  `合并后没有按名字排序：${JSON.stringify(scanData.skills.map((r) => r.name))}`,
+  JSON.stringify(scanData.skills.map((row: any) => row.name)) === JSON.stringify([...scanData.skills.map((row: any) => row.name)].sort()),
+  `合并后没有按名字排序：${JSON.stringify(scanData.skills.map((r: any) => r.name))}`,
 )
 check(
   'B83',
-  scanData.skills.every((row, index) => row.index === index),
-  `index 没有重排：${JSON.stringify(scanData.skills.map((r) => r.index))}`,
+  scanData.skills.every((row: any, index: number) => row.index === index),
+  `index 没有重排：${JSON.stringify(scanData.skills.map((r: any) => r.index))}`,
 )
 
 // **注册表优先**：同名时必须以官方那一行为准，直读只补它没有的名字。
@@ -697,8 +1358,8 @@ const dedupeHost = makeHost({
   files: { [`${PROJECT_AGENTS_ROOT}/git-commit/SKILL.md`]: md('git-commit', '文件里的描述') },
 })
 hostModule.apply(dedupeHost.ctx)
-const dedupeData = (await getJson(dedupeHost, `?sessionId=session-live&cwd=${encodeURIComponent(PROJECT_ROOT)}`)).body.data
-const dedupeRows = dedupeData.skills.filter((row) => row.name === 'git-commit')
+const dedupeData: any = (await getJson(dedupeHost, `?sessionId=session-live&cwd=${encodeURIComponent(PROJECT_ROOT)}`)).body.data
+const dedupeRows = dedupeData.skills.filter((row: any) => row.name === 'git-commit')
 check('B84', dedupeRows.length === 1, `同名条目应当只有 1 行，实际 ${dedupeRows.length} 行`)
 check('B85', dedupeRows[0]?.source === 'user-dsh', `同名时应保留注册表那一行，实际 source = ${JSON.stringify(dedupeRows[0]?.source)}`)
 check('B86', dedupeRows[0]?.description === 'git-commit 的描述', `同名时应保留注册表的描述，实际 = ${JSON.stringify(dedupeRows[0]?.description)}`)
@@ -715,8 +1376,8 @@ hostModule.apply(isolatedHost.ctx)
 const isolatedResult = await getJson(isolatedHost, `?sessionId=session-live&cwd=${encodeURIComponent(PROJECT_ROOT)}`)
 check(
   'B87',
-  isolatedResult.status === 200 && isolatedResult.body.data.skills.some((row) => row.name === 'git-commit'),
-  `一个根 resolve 失败时，另一个根必须照常出结果，实际 = ${JSON.stringify(isolatedResult.body.data.skills.map((r) => r.name))}`,
+  isolatedResult.status === 200 && isolatedResult.body.data.skills.some((row: any) => row.name === 'git-commit'),
+  `一个根 resolve 失败时，另一个根必须照常出结果，实际 = ${JSON.stringify(isolatedResult.body.data.skills.map((r: any) => r.name))}`,
 )
 
 // 单个文件读不了（或不是普通文件）只丢那一条。
@@ -733,11 +1394,11 @@ const partialFileHost = makeHost({
   files: { [`${PROJECT_AGENTS_ROOT}/readable/SKILL.md`]: md('readable', '读得到') },
 })
 hostModule.apply(partialFileHost.ctx)
-const partialFileData = (await getJson(partialFileHost, `?sessionId=session-live&cwd=${encodeURIComponent(PROJECT_ROOT)}`)).body.data
+const partialFileData: any = (await getJson(partialFileHost, `?sessionId=session-live&cwd=${encodeURIComponent(PROJECT_ROOT)}`)).body.data
 check(
   'B88',
-  JSON.stringify(partialFileData.skills.map((row) => row.name)) === JSON.stringify(['readable']),
-  `读不到的文件应被安静跳过，实际 = ${JSON.stringify(partialFileData.skills.map((r) => r.name))}`,
+  JSON.stringify(partialFileData.skills.map((row: any) => row.name)) === JSON.stringify(['readable']),
+  `读不到的文件应被安静跳过，实际 = ${JSON.stringify(partialFileData.skills.map((r: any) => r.name))}`,
 )
 
 // 没有 fs 服务时直读整体静默降级：注册表照常返回，不抛错、不编造。
@@ -752,38 +1413,35 @@ check('B89', noFsScanResult.status === 200 && noFsScanResult.body.data.skills.le
 const readScanHost = makeHost({
   existingPaths: [`${PROJECT_ROOT}/.git`],
   skills: [],
-  dirs: { [PROJECT_AGENTS_ROOT]: [{ name: 'git-commit', type: 'directory' }, { name: 'gone', type: 'directory' }] },
+  dirs: {
+    [PROJECT_AGENTS_ROOT]: [
+      { name: 'git-commit', type: 'directory' },
+      { name: 'gone', type: 'directory' },
+    ],
+  },
   files: { [`${PROJECT_AGENTS_ROOT}/git-commit/SKILL.md`]: md('git-commit', '提交代码') },
 })
 hostModule.apply(readScanHost.ctx)
-const readScanPost = await withEnv({ DSH_AGENTS_HOME: 'C:/agents' }, async () => {
-  const response = await readScanHost.routes[0].fetch(
-    POST({ op: 'read', name: 'git-commit', sessionId: 'session-live', cwd: PROJECT_ROOT }),
-  )
+const readScanPost: any = await withEnv({ DSH_AGENTS_HOME: 'C:/agents' }, async () => {
+  const response = await readScanHost.routes[0].fetch(POST({ op: 'read', name: 'git-commit', sessionId: 'session-live', cwd: PROJECT_ROOT }))
   return { status: response.status, body: await response.json() }
 })
 check('B92', readScanPost.status === 200 && readScanPost.body.ok === true, `直读出来的 skill 读不到正文：${JSON.stringify(readScanPost.body).slice(0, 200)}`)
 check(
   'B93',
-  typeof readScanPost.body.data?.content === 'string' &&
-    readScanPost.body.data.content.includes('提交代码') &&
-    readScanPost.body.data.content.includes('正文'),
+  typeof readScanPost.body.data?.content === 'string' && readScanPost.body.data.content.includes('提交代码') && readScanPost.body.data.content.includes('正文'),
   `正文内容不对：${JSON.stringify(readScanPost.body.data?.content)}`,
 )
 check('B94', readScanPost.body.data?.path === `${PROJECT_AGENTS_ROOT}/git-commit/SKILL.md`, `正文的 path = ${JSON.stringify(readScanPost.body.data?.path)}`)
 // 注册表与直读**都没有**的名字仍然要如实 409 —— 回退不是"什么都给你读出来"。
-const readMissingPost = await withEnv({ DSH_AGENTS_HOME: 'C:/agents' }, async () => {
-  const response = await readScanHost.routes[0].fetch(
-    POST({ op: 'read', name: 'no-such-skill', sessionId: 'session-live', cwd: PROJECT_ROOT }),
-  )
+const readMissingPost: any = await withEnv({ DSH_AGENTS_HOME: 'C:/agents' }, async () => {
+  const response = await readScanHost.routes[0].fetch(POST({ op: 'read', name: 'no-such-skill', sessionId: 'session-live', cwd: PROJECT_ROOT }))
   return { status: response.status, body: await response.json() }
 })
 check('B95', readMissingPost.status === 409 && readMissingPost.body.ok === false, `找不到的 skill 应 409，实际 ${readMissingPost.status}`)
 // 文件读不到（`gone` 目录没有 SKILL.md）同样要 409，而不是编一段空正文。
-const readGonePost = await withEnv({ DSH_AGENTS_HOME: 'C:/agents' }, async () => {
-  const response = await readScanHost.routes[0].fetch(
-    POST({ op: 'read', name: 'gone', sessionId: 'session-live', cwd: PROJECT_ROOT }),
-  )
+const readGonePost: any = await withEnv({ DSH_AGENTS_HOME: 'C:/agents' }, async () => {
+  const response = await readScanHost.routes[0].fetch(POST({ op: 'read', name: 'gone', sessionId: 'session-live', cwd: PROJECT_ROOT }))
   return { status: response.status, body: await response.json() }
 })
 check('B96', readGonePost.status === 409, `文件不在的 skill 应 409，实际 ${readGonePost.status}`)
@@ -794,7 +1452,7 @@ const cleanResult = await getJson(baseHost)
 check('B90', cleanResult.body.data.providerFailures === undefined, `providerFailures 应已下线，实际 = ${JSON.stringify(cleanResult.body.data.providerFailures)}`)
 // 直读用的根目录必须与 `roots` 探测出来的**同一个** projectRoot —— 两边漂了，
 // 就会出现「标签页说目录存在、直读却去扫了别的地方」。
-const scanRootBySource = Object.fromEntries((scanData.roots ?? []).map((root) => [root.source, root]))
+const scanRootBySource = Object.fromEntries((scanData.roots ?? []).map((root: any) => [root.source, root]))
 check(
   'B91',
   scanRootBySource['project-agents']?.path === PROJECT_AGENTS_ROOT && scanRootBySource['project-dsh']?.path === PROJECT_DSH_ROOT,
@@ -813,14 +1471,13 @@ check(
  * （真跑 hooks 的那个）重新加载一遍 bundle，否则组件里拿到的是 C 区那个替身，
  * hook 会永远返回 undefined。
  */
-function loadClientModule(reactImpl) {
-  const loads = []
-  const fakeWindow = { __ModuleLoader__: { load: (spec) => loads.push(spec) } }
-  const requireCalls = []
-  // eslint-disable-next-line no-new-func
+function loadClientModule(reactImpl: unknown): ClientModuleHandle {
+  const loads: ClientLoadSpec[] = []
+  const fakeWindow = { __ModuleLoader__: { load: (spec: ClientLoadSpec) => loads.push(spec) } }
+  const requireCalls: string[] = []
   new Function('window', clientSrc)(fakeWindow)
   const spec = loads[0]
-  const exportsObj = spec.factory((name) => {
+  const exportsObj = spec.factory((name: string) => {
     requireCalls.push(name)
     if (name === 'react') return reactImpl
     throw new Error(`unexpected require: ${name}`)
@@ -830,10 +1487,10 @@ function loadClientModule(reactImpl) {
 
 /** C 区用的替身 react：只够验证协议面，不跑 hooks。 */
 const STUB_REACT = {
-  createElement: () => null,
-  useState: () => [undefined, () => {}],
-  useEffect: () => {},
-  useCallback: (fn) => fn,
+  createElement: (): null => null,
+  useState: (): [undefined, () => void] => [undefined, () => {}],
+  useEffect: (): void => {},
+  useCallback: (fn: unknown): unknown => fn,
 }
 
 const clientModule = loadClientModule(STUB_REACT)
@@ -843,30 +1500,30 @@ check('C3', typeof clientModule.exportsObj?.apply === 'function', 'bundle 没有
 check('C4', clientModule.requireCalls.every((name) => name === 'react'), `require 被调用时用了 ${JSON.stringify(clientModule.requireCalls)}`)
 
 /** 用假 ctx 跑客户端 apply，捕获座位注册。 */
-function applyClient(exportsObj) {
-  const registrations = []
-  const injected = []
+function applyClient(exportsObj: any): ClientApplyHandle {
+  const registrations: SlotRegistration[] = []
+  const injected: string[] = []
   const scope = {
     slots: {
-      inject(key, callback) {
+      inject(key: string, callback: () => void) {
         injected.push(key)
         callback()
         return () => {}
       },
-      register(options, component) {
+      register(options: SlotOptions, component: unknown) {
         registrations.push({ options, component })
         return () => {}
       },
     },
   }
-  const ctx = { inject: (names, cb) => cb(scope) }
+  const ctx = { inject: (names: unknown, cb: (received: unknown) => void) => cb(scope) }
   // ensureStyles 在 node 下没有 document，应当安静跳过而不是抛错。
-  const previousDocument = globalThis.document
-  delete globalThis.document
+  const previousDocument = globalSlots.document
+  delete globalSlots.document
   try {
     exportsObj.apply(ctx)
   } finally {
-    if (previousDocument !== undefined) globalThis.document = previousDocument
+    if (previousDocument !== undefined) globalSlots.document = previousDocument
   }
   return { registrations, injected }
 }
@@ -889,28 +1546,33 @@ check('C13', registration?.options?.icon === undefined, '注册项声明了 icon
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** 迷你 React：只实现本组件用到的 hook，但**按调用顺序计位**（能抓条件式 hook）。 */
-function createRuntime() {
-  const instances = new Map()
-  const state = { current: null, dirty: false }
-  const sameDeps = (a, b) => {
+function createRuntime(): Runtime {
+  const instances = new Map<string, HookInstance>()
+  const state: RuntimeState = { current: null, dirty: false }
+  const sameDeps = (a?: unknown[], b?: unknown[]): boolean => {
     if (a === undefined || b === undefined) return false
     if (a.length !== b.length) return false
     return a.every((item, index) => Object.is(item, b[index]))
   }
+  const requireInstance = (): HookInstance => {
+    const inst = state.current
+    if (inst === null) throw new Error('hook 只能在组件渲染期间调用')
+    return inst
+  }
   const react = {
-    createElement(type, props, ...children) {
-      const merged = { ...(props ?? {}) }
+    createElement(type: unknown, props: Record<string, unknown> | null, ...children: unknown[]) {
+      const merged: Record<string, unknown> = { ...(props ?? {}) }
       if (children.length === 1) merged.children = children[0]
       else if (children.length > 1) merged.children = children
       return { type, props: merged }
     },
-    useState(initial) {
-      const inst = state.current
+    useState(initial: unknown): [unknown, (next: unknown) => void] {
+      const inst = requireInstance()
       const slot = inst.index++
-      if (!(slot in inst.hooks)) inst.hooks[slot] = typeof initial === 'function' ? initial() : initial
-      const set = (next) => {
+      if (!(slot in inst.hooks)) inst.hooks[slot] = typeof initial === 'function' ? (initial as () => unknown)() : initial
+      const set = (next: unknown): void => {
         const currentValue = inst.hooks[slot]
-        const value = typeof next === 'function' ? next(currentValue) : next
+        const value = typeof next === 'function' ? (next as (previous: unknown) => unknown)(currentValue) : next
         if (!Object.is(value, currentValue)) {
           inst.hooks[slot] = value
           state.dirty = true
@@ -918,36 +1580,39 @@ function createRuntime() {
       }
       return [inst.hooks[slot], set]
     },
-    useEffect(fn, deps) {
-      const inst = state.current
+    useEffect(fn: () => unknown, deps?: unknown[]): void {
+      const inst = requireInstance()
       const slot = inst.index++
       const previous = inst.effects[slot]
       if (previous === undefined || !sameDeps(previous.deps, deps)) {
         inst.effects[slot] = { fn, deps, pending: true, cleanup: previous?.cleanup }
       }
     },
-    useCallback(fn, deps) {
-      const inst = state.current
+    useCallback(fn: (...args: unknown[]) => unknown, deps?: unknown[]): (...args: unknown[]) => unknown {
+      const inst = requireInstance()
       const slot = inst.index++
       const previous = inst.callbacks[slot]
-      if (previous === undefined || !sameDeps(previous.deps, deps)) inst.callbacks[slot] = { fn, deps }
-      return inst.callbacks[slot].fn
+      const entry = previous === undefined || !sameDeps(previous.deps, deps) ? { fn, deps } : previous
+      inst.callbacks[slot] = entry
+      return entry.fn
     },
   }
   return { react, state, instances }
 }
 
 /** 把元素树展开成 host 节点树（函数组件就地展开，并记录每次渲染的 hook 位数）。 */
-function renderTree(runtime, element) {
-  const walk = (node, keyPath) => {
+function renderTree(runtime: Runtime, element: unknown): RenderedNode {
+  const walk = (node: unknown, keyPath: string): RenderedNode => {
     if (node === null || node === undefined || typeof node === 'boolean') return null
     if (typeof node === 'string' || typeof node === 'number') return { kind: 'text', text: String(node) }
     if (Array.isArray(node)) {
       return { kind: 'frag', children: node.map((child, index) => walk(child, `${keyPath}[${index}]`)) }
     }
-    const { type, props } = node
+    // 元素是 `{ type, props }`——由假 react.createElement 造出来，形状由本文件决定。
+    const { type, props } = node as { type: unknown; props: Record<string, unknown> }
     if (typeof type === 'function') {
-      const instanceKey = `${keyPath}#${type.name === '' ? 'anon' : type.name}`
+      const componentFn = type as (props: unknown) => unknown
+      const instanceKey = `${keyPath}#${componentFn.name === '' ? 'anon' : componentFn.name}`
       let inst = runtime.instances.get(instanceKey)
       if (inst === undefined) {
         inst = { hooks: [], effects: [], callbacks: [], index: 0, history: [] }
@@ -956,22 +1621,22 @@ function renderTree(runtime, element) {
       const outer = runtime.state.current
       runtime.state.current = inst
       inst.index = 0
-      let out
+      let out: unknown
       try {
-        out = type(props)
+        out = componentFn(props)
       } finally {
         runtime.state.current = outer
       }
       inst.history.push(inst.index)
       return walk(out, instanceKey)
     }
-    return { kind: 'host', type, props, children: walk(props.children, `${keyPath}>${type}`) }
+    return { kind: 'host', type: String(type), props, children: walk(props.children, `${keyPath}>${String(type)}`) }
   }
   return walk(element, '$')
 }
 
 /** host 节点子树里的全部文本。 */
-function textOf(node) {
+function textOf(node: RenderedNode): string {
   if (node === null || node === undefined) return ''
   if (node.kind === 'text') return node.text
   if (node.kind === 'frag') return node.children.map(textOf).join('')
@@ -979,7 +1644,7 @@ function textOf(node) {
 }
 
 /** 摊平出所有 host 节点。 */
-function hostsOf(node, out = []) {
+function hostsOf(node: RenderedNode, out: HostNode[] = []): HostNode[] {
   if (node === null || node === undefined) return out
   if (node.kind === 'host') {
     out.push(node)
@@ -991,14 +1656,14 @@ function hostsOf(node, out = []) {
 }
 
 /** 跑一遍待执行 effect（依赖变了的才算），await 掉里面的异步。 */
-async function runEffects(runtime) {
+async function runEffects(runtime: Runtime): Promise<number> {
   let ran = 0
   for (const inst of runtime.instances.values()) {
     for (const effect of inst.effects) {
       if (effect === undefined || effect.pending !== true) continue
       effect.pending = false
       if (typeof effect.cleanup === 'function') effect.cleanup()
-      effect.cleanup = await effect.fn()
+      effect.cleanup = (await effect.fn()) as (() => void) | undefined
       ran++
     }
   }
@@ -1006,8 +1671,8 @@ async function runEffects(runtime) {
 }
 
 /** 反复「渲染 → 跑 effect → 等异步回落」，直到稳定。 */
-async function mount(runtime, component, props, maxPasses = 8) {
-  let view = null
+async function mount(runtime: Runtime, component: (props?: any) => any, props: Record<string, unknown>, maxPasses = 8): Promise<{ view: RenderedNode; passes: number }> {
+  let view: RenderedNode = null
   for (let pass = 0; pass < maxPasses; pass++) {
     runtime.state.dirty = false
     view = renderTree(runtime, runtime.react.createElement(component, props))
@@ -1028,13 +1693,13 @@ const MAIN_SESSION_STATE = {
   },
 }
 
-const REAL_FETCH = globalThis.fetch
+const REAL_FETCH = globalSlots.fetch
 
 /** 装上假 fetch；`fetchCalls` 是调用方给的记账数组。 */
-function patchFetch(handler, fetchCalls) {
-  globalThis.fetch = async (url, init) => {
-    fetchCalls.push({ url: String(url), init })
-    return handler(String(url), init)
+function patchFetch(handler: FetchHandler, fetchCalls: FetchCall[]): void {
+  globalSlots.fetch = async (url: unknown, init?: unknown) => {
+    fetchCalls.push({ url: String(url), init: init as FetchInit | undefined })
+    return handler(String(url), init as FetchInit | undefined)
   }
 }
 
@@ -1052,23 +1717,27 @@ const MAIN_WORKSPACE_STATE = {
  * 每次都**重新加载一遍 bundle**，把本 runtime 的 react 交给它——这样组件里的 hooks
  * 才是真的（见 loadClientModule 的注释）。
  */
-async function renderSection(fetchHandler, sessionState = MAIN_SESSION_STATE, workspaceState = MAIN_WORKSPACE_STATE) {
+async function renderSection(fetchHandler: FetchHandler, sessionState: unknown = MAIN_SESSION_STATE, workspaceState: unknown = MAIN_WORKSPACE_STATE): Promise<RenderedSection> {
   const runtime = createRuntime()
   const mod = loadClientModule(runtime.react)
-  const component = applyClient(mod.exportsObj).registrations[0].component
-  const fetchCalls = []
+  const component = applyClient(mod.exportsObj).registrations[0].component as (props?: any) => any
+  const fetchCalls: FetchCall[] = []
   patchFetch(fetchHandler, fetchCalls)
   try {
     // useSessions / useWorkspaces 都各占一个 hook 位，这样 hook 计数与真实运行时同形。
-    const useSessions = (selector) => {
-      runtime.state.current.index++
+    const useSessions = (selector: (state: unknown) => unknown): unknown => {
+      const inst = runtime.state.current
+      if (inst === null) throw new Error('useSessions 只能在组件渲染期间调用')
+      inst.index++
       return selector(sessionState)
     }
-    const useWorkspaces = (selector) => {
-      runtime.state.current.index++
+    const useWorkspaces = (selector: (state: unknown) => unknown): unknown => {
+      const inst = runtime.state.current
+      if (inst === null) throw new Error('useWorkspaces 只能在组件渲染期间调用')
+      inst.index++
       return selector(workspaceState)
     }
-    const props = { useSessions, useWorkspaces }
+    const props: Record<string, unknown> = { useSessions, useWorkspaces }
     const mounted = await mount(runtime, component, props)
     return {
       runtime,
@@ -1081,13 +1750,46 @@ async function renderSection(fetchHandler, sessionState = MAIN_SESSION_STATE, wo
       hosts: hostsOf(mounted.view),
     }
   } finally {
-    globalThis.fetch = REAL_FETCH
+    globalSlots.fetch = REAL_FETCH
   }
 }
 
-const catalogResponse = (payload) => ({ status: 200, json: async () => ({ ok: true, data: payload }) })
+/** D 区夹具里的 payload 契约（宿主返回的 `data` 形状的一个子集）。 */
+interface CatalogSkill {
+  name: string
+  description: string
+  source: string
+  group: string
+  provider: string
+  modelInvocable: boolean
+  path?: string
+}
 
-const CATALOG = {
+interface CatalogRoot {
+  group: string
+  source: string
+  path?: string
+  exists?: boolean
+  note?: string
+}
+
+interface CatalogPayload {
+  skills: CatalogSkill[]
+  counts: Record<string, number>
+  providers: Record<string, number>
+  roots: CatalogRoot[]
+  projectRoot?: string
+  complete?: boolean
+  resolvedBy?: string
+  presetId?: string
+  cwd?: string
+  capabilities?: string[]
+  providerFailures?: unknown
+}
+
+const catalogResponse = (payload: CatalogPayload): FakeResponse => ({ status: 200, json: async () => ({ ok: true, data: payload }) })
+
+const CATALOG: CatalogPayload = {
   skills: [
     { name: 'alpha', description: 'alpha 的描述', source: 'project-dsh', group: 'project', provider: 'filesystem', modelInvocable: true, path: 'C:/skills/alpha/SKILL.md' },
     { name: 'gamma', description: 'gamma 的描述', source: 'user-dsh', group: 'global', provider: 'filesystem', modelInvocable: true, path: 'C:/skills/gamma/SKILL.md' },
@@ -1147,7 +1849,7 @@ check(
 check('D13', sectionInstance?.history[0] === 9, `SkillSection 的 hook 位 = ${sectionInstance?.history[0]}，期望 9（useSessions + useWorkspaces + 4×useState + useEffect + useCallback）`)
 
 // —— 展开正文 ——
-const expandFetch = async (url, init) => {
+const expandFetch: FetchHandler = async (url, init) => {
   if (init?.method === 'POST') {
     return {
       status: 200,
@@ -1165,14 +1867,14 @@ patchFetch(expandRender.fetchHandler, expandRender.fetchCalls)
 try {
   await viewButton?.props?.onClick?.()
 } finally {
-  globalThis.fetch = REAL_FETCH
+  globalSlots.fetch = REAL_FETCH
 }
 const expandedMounted = await (async () => {
   patchFetch(expandRender.fetchHandler, expandRender.fetchCalls)
   try {
     return await mount(expandRender.runtime, expandRender.component, expandRender.props)
   } finally {
-    globalThis.fetch = REAL_FETCH
+    globalSlots.fetch = REAL_FETCH
   }
 })()
 const expandedText = textOf(expandedMounted.view)
@@ -1238,10 +1940,13 @@ check(
 // —— 空目录也必须能看到「项目 / 全局」两组 ——
 // 这是第一次真实实测暴露的直接问题：只渲染非空分组时，用户看到一片空白，
 // 分不清"本机没有 skill"和"这个分组根本没实现"。
-const emptyGroupsRender = await renderSection(async () =>
-  catalogResponse({ ...CATALOG, skills: [], counts: {}, providers: {} }),
-)
-for (const [id, label] of [['D27', '项目'], ['D28', '全局'], ['D29', '自定义'], ['D30', '随包内置']]) {
+const emptyGroupsRender = await renderSection(async () => catalogResponse({ ...CATALOG, skills: [], counts: {}, providers: {} }))
+for (const [id, label] of [
+  ['D27', '项目'],
+  ['D28', '全局'],
+  ['D29', '自定义'],
+  ['D30', '随包内置'],
+] as Array<[string, string]>) {
   check(id, emptyGroupsRender.text.includes(label), `skills 为空时没有渲染「${label}」分组标题`)
 }
 // **根目录路径与「存在/不存在」小字整体下线**：那一块是排查面板，不是使用者要看的内容。
@@ -1283,7 +1988,7 @@ check(
 
 // —— 分组只以「标签页 + 个数」呈现，一次展开一个 ——
 // 规范标签页永远都列出来（含 0），所以「空」仍然一眼可见，但内容不堆叠。
-const tabButtons = (render) =>
+const tabButtons = (render: RenderedSection): HostNode[] =>
   render.hosts.filter((node) => {
     const className = node.props?.className
     return typeof className === 'string' && className.split(' ').includes('dskm-tab')
@@ -1304,10 +2009,7 @@ check('D42', readyRender.text.includes('gamma'), '合并后「项目 + 全局」
 const mixedRender = await renderSection(async () =>
   catalogResponse({
     ...CATALOG,
-    skills: [
-      ...CATALOG.skills,
-      { name: 'office-docx', description: 'docx', source: 'bundled', group: 'bundled', provider: 'dsh-office', modelInvocable: true },
-    ],
+    skills: [...CATALOG.skills, { name: 'office-docx', description: 'docx', source: 'bundled', group: 'bundled', provider: 'dsh-office', modelInvocable: true }],
     counts: { project: 1, global: 1, custom: 0, bundled: 1, other: 0 },
   }),
 )
@@ -1363,12 +2065,12 @@ const workspaceOption = switchedRender.hosts.find(
 check('D55', workspaceOption !== undefined, '没找到范围下拉框')
 // 后续所有触发/挂载都必须在**假 fetch 装着**的窗口内做：客户端的 ROUTE 是同源相对路径，
 // 漏到 Node 的原生 fetch 会直接抛错（踩过：表现为"切换之后什么也没发生"）。
-const withFakeFetch = async (run) => {
+const withFakeFetch = async <T>(run: () => Promise<T>): Promise<T> => {
   patchFetch(switchedRender.fetchHandler, switchedRender.fetchCalls)
   try {
     return await run()
   } finally {
-    globalThis.fetch = REAL_FETCH
+    globalSlots.fetch = REAL_FETCH
   }
 }
 // onChange 的值是工作区路径；空串表示"当前会话"。
@@ -1423,14 +2125,13 @@ try {
   )
   await freshButton?.props?.onClick?.()
 } finally {
-  globalThis.fetch = REAL_FETCH
+  globalSlots.fetch = REAL_FETCH
 }
 await mount(readWithCwd.runtime, readWithCwd.component, readWithCwd.props)
 const readPost = readWithCwd.fetchCalls.find((call) => call.init?.method === 'POST')
 // ⚠️ 别用 JSON.stringify(…).includes(…)：JSON 会把 `/` 转义成 `\/`，永远匹配不上。
-const readPostBody = readPost === undefined ? {} : JSON.parse(String(readPost.init?.body ?? '{}'))
+const readPostBody: any = readPost === undefined ? {} : JSON.parse(String(readPost.init?.body ?? '{}'))
 check('D60', readPostBody?.cwd === 'D:/project/agent-go', `展开正文的 POST 没带选中的 cwd，实际 = ${JSON.stringify(readPostBody)}`)
-
 
 // —— 提供方原文 / 提供方汇总：**整块下线**（用户要求「冗余提示都去掉」）——
 // 反面钉一次：旧宿主若仍然塞 `providerFailures`，页面上也不许出现任何内部原文。
@@ -1449,9 +2150,7 @@ const providerFailRender = await renderSection(async () =>
 )
 check(
   'D47',
-  [FAIL_TEXT, 'FsError', '候选被整体丢弃', '本次发现未完成', '提供方', '完整性', 'filesystemx1'].every(
-    (needle) => !providerFailRender.text.includes(needle),
-  ),
+  [FAIL_TEXT, 'FsError', '候选被整体丢弃', '本次发现未完成', '提供方', '完整性', 'filesystemx1'].every((needle) => !providerFailRender.text.includes(needle)),
   `提供方失败相关文案都不该渲染，文本片段 = ${JSON.stringify(providerFailRender.text.slice(0, 320))}`,
 )
 check('D48', providerFailRender.text.includes('alpha'), '去掉诊断之后，列表本身必须照常渲染')

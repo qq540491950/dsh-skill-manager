@@ -1,0 +1,23 @@
+// 工具脚本的类型检查。
+//
+// 覆盖 `tools/build.ts` 与 `tools/verify.ts` 两个文件：
+//   - 两者都能**直接跑**（`node tools/build.ts` / `node tools/verify.ts`，Node ≥22.18 原生
+//     类型擦除，零构建）——所以它们不属于任何 composite project，也不产出 .d.ts。
+//   - 自检脚本是"测试替身 + 断言"的代码：它必须往数组里塞各种形状的假对象、按序号取下标
+//     （`registered[0]`、`cells[2]`）。四处在 tools 内**刻意关掉**的开关见下，产品侧
+//     `src/**` 全部保持开启。
+//     关掉它们**不损失**我们要的那部分安全性：implicit any、属性名写错、传参不符
+//     全部由 strict 自己覆盖——这也正是这次迁移要修的东西。
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["node"],
+    "noEmit": true,
+    "noUncheckedIndexedAccess": false,
+    "exactOptionalPropertyTypes": false,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false
+  },
+  "include": ["tools/**/*.ts"]
+}

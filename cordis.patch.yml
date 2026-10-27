@@ -1,0 +1,16 @@
+# dsh-skill-manager bundle 自带的补丁层（`package.json` 的 `dsh.bundle.patch` 指向本文件）。
+#
+# 这里**只有插件自己这一行**：装上本 bundle 就等于在 profile 的 Loader 里插入这条条目，
+# 用户不需要再手写 `cordis.patch.yml`。
+#
+# ⚠️ 插件行必须写在 `insert:` 下，**不能**写成顶层的 `- id: X`：顶层 `- id: X` 是"覆写已存在
+#    条目"，目标不存在时 `applyEntryPatches` 直接 warn 并丢弃（AGENTS 1.4）——那样插件根本
+#    不会出现，表现就是"设置里没有 Skills 页"。自检 P3 钉住"插件行在 insert 里"。
+#
+# ⚠️ 本行 `id` 是本地的 Loader 条目 id。**手写挂载与 bundle 安装不能并存**：profile 里若还留着
+#    `- insert: [{ id: dsh-skill-manager, name: 'file:///…/lib/index.js' }]` 这条手写行，
+#    与 bundle 插入的是**同 id 的两条条目**，后插入者赢——不报错，只会让人以为"装了个假的"。
+#    迁移顺序见 README 第 6 节：先装 bundle、确认页面在，再删手写行。
+- insert:
+    - id: dsh-skill-manager # Loader 条目 id（profile 里的 include:dsh-skill-manager 就是它）
+      name: '@qq540491950/dsh-skill-manager' # 必须等于 package.json 的 name（自检 P4）

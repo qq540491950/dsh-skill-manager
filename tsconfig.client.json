@@ -1,0 +1,29 @@
+// 客户端半边（Client half）的编译单元。
+//
+// 两条硬约束，与宿主那份互为镜像：
+//   1. `lib` 只有 DOM + ES2022 —— **没有 node 全局**。这一半跑在浏览器里，
+//      写 `process` / `require('node:fs')` 直接编译失败。
+//   2. `types: ["react"]` 只为拿 react 的类型；它不引入任何 node 全局。
+//
+// 本半边的视图函数**不用 JSX**，一律 `h(...)`（= `react.createElement`）：产物因此只
+// `require("react")`（确定在基座模块表里），完全不碰 `react/jsx-runtime`——
+// 不必赌 jsx-runtime 是否在平台种子表里。
+//
+// 产物：只产出 .d.ts（`lib/types/client/**`）。真正的 .js 由 tools/build.ts 打包成
+// classic script（懒 CJS 工厂）再包装。
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["react"],
+    "emitDeclarationOnly": true,
+    "declaration": true,
+    "declarationMap": false,
+    "rootDir": "src",
+    "outDir": "lib/types",
+    // 同宿主那份：增量缓存不放 lib/，免得发布时夹带构建缓存。
+    "tsBuildInfoFile": ".tsbuildinfo/client.tsbuildinfo"
+  },
+  "include": ["src/client/**/*.ts", "src/shared/**/*.ts"]
+}

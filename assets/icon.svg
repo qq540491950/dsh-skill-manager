@@ -1,0 +1,24 @@
+<!--
+  bundle 卡片图标（`package.json` 的 `icon` 指向本文件）。
+
+  为什么这样画：
+    1. 显式 `fill`，**不用 `currentColor`** —— 卡片图标不继承页面的 CSS，`currentColor`
+       会退化成初始黑，深色主题下几乎看不见（兄弟仓库踩过这个坑）。
+    2. 底是中性蓝 `#3B6FE0`，白描边对它恒有对比度，深浅两套主题下都能看清。
+    3. 图形语义就是这一页在做的事：一叠**条目清单**（三条 dot + 线）+ 一颗**能力星**
+       （右下角四角星），不借用任何官方产品 mark。
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Skills">
+  <rect x="0" y="0" width="64" height="64" rx="14" fill="#3B6FE0"/>
+  <!-- 清单：三条「点 + 线」，越靠下越短，暗示这是列表而不是表格 -->
+  <g fill="#FFFFFF">
+    <circle cx="17" cy="22" r="3"/>
+    <rect x="24" y="19.5" width="23" height="5" rx="2.5"/>
+    <circle cx="17" cy="32" r="3"/>
+    <rect x="24" y="29.5" width="18" height="5" rx="2.5"/>
+    <circle cx="17" cy="42" r="3"/>
+    <rect x="24" y="39.5" width="13" height="5" rx="2.5"/>
+  </g>
+  <!-- 能力星：技能/本领的通用符号，压在清单右下角，不遮挡任何一行 -->
+  <path d="M46 40 l2.6 5.4 5.4 2.6 -5.4 2.6 -2.6 5.4 -2.6 -5.4 -5.4 -2.6 5.4 -2.6 z" fill="#FFD166"/>
+</svg>

@@ -1,0 +1,23 @@
+{
+  "tool": "esbuild@0.28.2",
+  "targets": [
+    {
+      "output": "lib/index.js",
+      "outputSha256": "8e8d81b3e5a5e24aa71cf3aabec321bd581b3851df6102f58c6d5e6a3f32adbb",
+      "inputs": {
+        "src/host/index.ts": "e5f44bc6dad72a6c94eba4902aa9d74d8052371f8494c40012af63749defa296",
+        "src/host/service-types.ts": "acf71ddd266faedb1eea52d7ff1b18f62e92412f6be521227cd5483521539654",
+        "src/shared/types.ts": "56872ceac187913cdb8d1d5836789c9b061dcd1aac4663d8e2e261bed13c0273"
+      }
+    },
+    {
+      "output": "lib/client.js",
+      "outputSha256": "a0359fe0b8508a8e6228e706480ffff8ab7d7772a24f70d979f2858a636b9ebb",
+      "inputs": {
+        "src/client/index.ts": "5daee65d4d8502e6d478b2ea8c26efe804ac014dee24064db7ce8b1ae6963b47",
+        "src/client/service-types.ts": "f293e573591fa42ab102c0b5478890beb2113babf05ee390c3132c55b38272ed",
+        "src/shared/types.ts": "56872ceac187913cdb8d1d5836789c9b061dcd1aac4663d8e2e261bed13c0273"
+      }
+    }
+  ]
+}

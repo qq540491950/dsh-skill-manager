@@ -1,0 +1,26 @@
+// 宿主半边（Host half）的编译单元。
+//
+// 两条硬约束写在这里，而不是写在文档里：
+//   1. `lib` 只有 ES2022 —— **没有 DOM**。宿主半边写 `document` / `window` 直接编译失败。
+//      （客户端那半边反过来：只有 DOM，没有 node 类型。见 tsconfig.client.json。）
+//   2. `types: ["node"]` —— 这一半**就跑在 Node 里**，`process` / `fetch` / `Response`
+//      这些全局本来就该有类型。真正的隔离靠"没有 DOM"，不靠"没有 node"。
+//
+// 产物：只产出 .d.ts（`lib/types/**`）。真正的 .js 由 esbuild 打包成单文件
+// `lib/index.js`（见 tools/build.ts），因为宿主半边**运行时必须零 import**（AGENTS 2.1）。
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "emitDeclarationOnly": true,
+    "declaration": true,
+    "declarationMap": false,
+    "rootDir": "src",
+    "outDir": "lib/types",
+    // 增量缓存不放 lib/：`files` 里会整目录带上 lib，发布时不该夹带构建缓存。
+    "tsBuildInfoFile": ".tsbuildinfo/host.tsbuildinfo"
+  },
+  "include": ["src/host/**/*.ts", "src/shared/**/*.ts"]
+}
